@@ -45,13 +45,16 @@ use uuid::Uuid;
 
 use crate::{
     InConfigState, LocalPlayerBundle, connection::RawConnection, disconnect::DisconnectEvent,
-    local_player::WorldHolder, packet::game::SendGamePacketEvent, player::GameProfileComponent,
+    join::AttemptToken, local_player::WorldHolder, packet::game::SendGamePacketEvent,
+    player::GameProfileComponent,
 };
 
 /// A way to simulate a client in a server, used for some internal tests.
 pub struct Simulation {
     pub app: App,
     pub entity: Entity,
+    /// The attempt identity of this simulated connection.
+    pub attempt_token: AttemptToken,
 
     // the runtime needs to be kept around for the tasks to be considered alive
     pub rt: tokio::runtime::Runtime,
@@ -61,10 +64,14 @@ impl Simulation {
     pub fn new(conn_protocol: ConnectionProtocol) -> Self {
         let mut app = create_simulation_app();
 
+        let attempt_token = AttemptToken::mint();
         let mut entity = app.world_mut().spawn_empty();
-        let (player, rt) =
-            create_local_player_bundle(entity.id(), ConnectionProtocol::Configuration);
-        entity.insert((player, ClientInformation::default()));
+        let (player, rt) = create_local_player_bundle(
+            entity.id(),
+            ConnectionProtocol::Configuration,
+            attempt_token,
+        );
+        entity.insert((player, ClientInformation::default(), attempt_token));
 
         let entity = entity.id();
 
@@ -77,7 +84,12 @@ impl Simulation {
         ));
         tick_app(&mut app);
 
-        let mut simulation = Self { app, entity, rt };
+        let mut simulation = Self {
+            app,
+            entity,
+            attempt_token,
+            rt,
+        };
 
         #[allow(clippy::single_match)]
         match conn_protocol {
@@ -193,6 +205,7 @@ impl Simulation {
         self.app.world_mut().write_message(DisconnectEvent {
             entity: self.entity,
             reason: None,
+            attempt_token: Some(self.attempt_token),
         });
     }
 }
@@ -280,12 +293,14 @@ impl SentPackets {
 fn create_local_player_bundle(
     entity: Entity,
     connection_protocol: ConnectionProtocol,
+    attempt_token: AttemptToken,
 ) -> (LocalPlayerBundle, tokio::runtime::Runtime) {
     // unused since we'll trigger ticks ourselves
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let raw_connection = RawConnection::new_networkless(connection_protocol);
+    let raw_connection =
+        RawConnection::new_networkless_with_token(connection_protocol, attempt_token);
 
     let world = World::default();
     let world_holder = WorldHolder::new(entity, Arc::new(RwLock::new(world)));

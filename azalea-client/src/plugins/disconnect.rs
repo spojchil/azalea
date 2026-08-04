@@ -10,6 +10,7 @@ use bevy_ecs::prelude::*;
 use derive_more::Deref;
 use tracing::info;
 
+use super::join::AttemptToken;
 use super::login::IsAuthenticated;
 #[cfg(feature = "online-mode")]
 use crate::chat_signing;
@@ -51,6 +52,11 @@ impl Plugin for DisconnectPlugin {
 pub struct DisconnectEvent {
     pub entity: Entity,
     pub reason: Option<FormattedText>,
+    /// The join attempt that produced this disconnect. `None` is only valid
+    /// for legacy/test event writers; production events are stamped at their
+    /// production site and are never matched against the entity's "current"
+    /// attempt at read time.
+    pub attempt_token: Option<AttemptToken>,
 }
 
 /// A bundle of components that are removed when a client disconnects.
@@ -91,8 +97,27 @@ pub fn remove_components_from_disconnected_players(
     mut commands: Commands,
     mut events: MessageReader<DisconnectEvent>,
     mut loaded_by_query: Query<&mut azalea_entity::LoadedBy>,
+    current_attempt: Query<Option<&AttemptToken>>,
 ) {
-    for DisconnectEvent { entity, reason } in events.read() {
+    for DisconnectEvent {
+        entity,
+        reason,
+        attempt_token,
+    } in events.read()
+    {
+        let event_token = *attempt_token;
+        let matches_current_attempt = match (event_token, current_attempt.get(*entity)) {
+            (Some(event_token), Ok(Some(current_token))) => event_token == *current_token,
+            // Legacy/test disconnect without an identity is only honored on an
+            // entity that also has no current attempt identity. A tokenless
+            // event must never fall back to "the entity's current attempt".
+            (None, Ok(None)) => true,
+            _ => false,
+        };
+        if !matches_current_attempt {
+            tracing::debug!("Ignoring disconnect event for a stale attempt on entity {entity:?}");
+            continue;
+        }
         info!(
             "A client {entity:?} was disconnected{}",
             if let Some(reason) = reason {
@@ -131,14 +156,18 @@ fn update_read_packets_task_running_component(
 
 #[allow(clippy::type_complexity)]
 fn disconnect_on_connection_dead(
-    query: Query<(Entity, &IsConnectionAlive), (Changed<IsConnectionAlive>, With<LocalEntity>)>,
+    query: Query<
+        (Entity, &IsConnectionAlive, &RawConnection),
+        (Changed<IsConnectionAlive>, With<LocalEntity>),
+    >,
     mut disconnect_events: MessageWriter<DisconnectEvent>,
 ) {
-    for (entity, &is_connection_alive) in &query {
+    for (entity, &is_connection_alive, raw_connection) in &query {
         if !*is_connection_alive {
             disconnect_events.write(DisconnectEvent {
                 entity,
                 reason: None,
+                attempt_token: Some(raw_connection.attempt_token()),
             });
         }
     }

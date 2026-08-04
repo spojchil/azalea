@@ -6,7 +6,7 @@ use azalea_client::{
     account::Account,
     connection::RawConnection,
     disconnect::DisconnectEvent,
-    join::{ConnectOpts, StartJoinServerEvent},
+    join::{AttemptToken, ConnectOpts, StartJoinServerEvent},
     local_player::{Experience, Hunger, TabList, WorldHolder},
     packet::game::SendGamePacketEvent,
     player::{GameProfileComponent, PlayerInfo},
@@ -72,6 +72,13 @@ pub struct Client {
     /// [`Self::query_entity`], or another one of those related functions to
     /// access the ECS instead.
     pub ecs: Arc<RwLock<bevy_ecs::world::World>>,
+
+    /// The immutable identity of the join attempt that created this handle.
+    /// `None` is only produced by the legacy [`Client::new`] constructor (for
+    /// tests/utility handles); every handle returned by
+    /// [`Client::start_client`] or [`Swarm::add_with_opts`](crate::swarm::Swarm::add_with_opts)
+    /// carries the minted attempt token.
+    attempt_token: Option<AttemptToken>,
 }
 
 pub struct StartClientOpts {
@@ -143,12 +150,45 @@ impl Client {
     /// You should only use this if you want to change these fields from the
     /// defaults, otherwise use [`Client::join`].
     pub fn new(entity: Entity, ecs: Arc<RwLock<bevy_ecs::world::World>>) -> Self {
-        Self {
-            // default our id to 0, it'll be set later
-            entity,
+        // Snapshot the entity's current attempt identity once, at construction
+        // time, and retain it forever on this handle. `disconnect()` uses the
+        // snapshot, never a later "current attempt" read. An entity without an
+        // attempt component yields `None` (legacy/test handles).
+        let attempt_token = ecs.read().get::<AttemptToken>(entity).copied();
+        Self::with_optional_attempt_token(entity, ecs, attempt_token)
+    }
 
+    /// Create a client handle for an entity that retains the given join
+    /// attempt identity.
+    ///
+    /// Production paths use this with the token minted for the attempt;
+    /// tests that need a specific identity can use it as an explicit
+    /// constructor instead of falling back to reading "the current attempt".
+    pub fn new_with_attempt_token(
+        entity: Entity,
+        ecs: Arc<RwLock<bevy_ecs::world::World>>,
+        attempt_token: AttemptToken,
+    ) -> Self {
+        Self::with_optional_attempt_token(entity, ecs, Some(attempt_token))
+    }
+
+    pub(crate) fn with_optional_attempt_token(
+        entity: Entity,
+        ecs: Arc<RwLock<bevy_ecs::world::World>>,
+        attempt_token: Option<AttemptToken>,
+    ) -> Self {
+        Self {
+            entity,
             ecs,
+            attempt_token,
         }
+    }
+
+    /// The immutable join-attempt identity of this handle, if it was created
+    /// by a real join attempt. This is the value a backend binds to its own
+    /// epoch; it is never re-read from the reused entity.
+    pub fn attempt_token(&self) -> Option<AttemptToken> {
+        self.attempt_token
     }
 
     /// Connect to a Minecraft server.
@@ -205,18 +245,22 @@ impl Client {
             event_sender,
         }: StartClientOpts,
     ) -> Self {
-        // send a StartJoinServerEvent
+        // Mint the immutable attempt identity exactly once, before the
+        // StartJoinServerEvent enters the ECS message flow. Handlers carry it
+        // through; they never re-mint.
+        let attempt_token = AttemptToken::mint();
 
         let (start_join_callback_tx, mut start_join_callback_rx) =
-            mpsc::unbounded_channel::<Entity>();
+            mpsc::unbounded_channel::<(Entity, AttemptToken)>();
 
         ecs_lock.write().write_message(StartJoinServerEvent {
             account,
             connect_opts,
             start_join_callback_tx: Some(start_join_callback_tx),
+            attempt_token,
         });
 
-        let entity = start_join_callback_rx.recv().await.expect(
+        let (entity, attempt_token) = start_join_callback_rx.recv().await.expect(
             "start_join_callback should not be dropped before sending a message, this is a bug in Azalea",
         );
 
@@ -227,7 +271,7 @@ impl Client {
                 .insert(LocalPlayerEvents(event_sender));
         }
 
-        Client::new(entity, ecs_lock)
+        Client::new_with_attempt_token(entity, ecs_lock, attempt_token)
     }
 
     /// Write a packet directly to the server.
@@ -250,6 +294,7 @@ impl Client {
         self.ecs.write().write_message(DisconnectEvent {
             entity: self.entity,
             reason: None,
+            attempt_token: self.attempt_token,
         });
     }
 
@@ -532,5 +577,74 @@ impl Client {
         self.get_component::<TicksConnected>()
             .map(|c| c.0)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use azalea_client::disconnect::DisconnectEvent;
+    use bevy_ecs::message::Messages;
+
+    #[test]
+    fn client_retains_attempt_token_and_disconnect_stamps_it() {
+        let world = Arc::new(RwLock::new(bevy_ecs::world::World::new()));
+        world.write().init_resource::<Messages<DisconnectEvent>>();
+        let entity = world.write().spawn_empty().id();
+        let token = AttemptToken::mint();
+
+        let client = Client::new_with_attempt_token(entity, world.clone(), token);
+        assert_eq!(client.attempt_token(), Some(token));
+
+        client.disconnect();
+
+        let world_guard = world.read();
+        let messages = world_guard.resource::<Messages<DisconnectEvent>>();
+        let mut cursor = messages.get_cursor();
+        let events: Vec<_> = cursor.read(messages).collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity, entity);
+        assert_eq!(events[0].attempt_token, Some(token));
+    }
+
+    #[test]
+    fn legacy_client_constructor_has_no_attempt_identity() {
+        let world = Arc::new(RwLock::new(bevy_ecs::world::World::new()));
+        let entity = world.write().spawn_empty().id();
+
+        let client = Client::new(entity, world.clone());
+        assert_eq!(client.attempt_token(), None);
+    }
+
+    #[test]
+    fn client_new_snapshots_entity_attempt_and_disconnect_keeps_it() {
+        let world = Arc::new(RwLock::new(bevy_ecs::world::World::new()));
+        world.write().init_resource::<Messages<DisconnectEvent>>();
+        let entity = world.write().spawn_empty().id();
+        let token_a = AttemptToken::mint();
+        world.write().entity_mut(entity).insert(token_a);
+
+        // Construction snapshots A and must keep it forever, even after the
+        // entity moves on to B.
+        let client = Client::new(entity, world.clone());
+        assert_eq!(client.attempt_token(), Some(token_a));
+
+        let token_b = AttemptToken::mint();
+        assert_ne!(token_a, token_b);
+        world.write().entity_mut(entity).insert(token_b);
+
+        client.disconnect();
+
+        let world_guard = world.read();
+        let messages = world_guard.resource::<Messages<DisconnectEvent>>();
+        let mut cursor = messages.get_cursor();
+        let events: Vec<_> = cursor.read(messages).collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity, entity);
+        assert_eq!(
+            events[0].attempt_token,
+            Some(token_a),
+            "disconnect must stamp the construction-time snapshot, not the current entity token"
+        );
     }
 }

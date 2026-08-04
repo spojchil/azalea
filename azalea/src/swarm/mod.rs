@@ -12,7 +12,11 @@ use std::sync::{
     atomic::{self, AtomicBool},
 };
 
-use azalea_client::{account::Account, chat::ChatPacket, join::ConnectOpts};
+use azalea_client::{
+    account::Account,
+    chat::ChatPacket,
+    join::{AttemptToken, ConnectOpts},
+};
 use azalea_entity::LocalEntity;
 use azalea_protocol::address::ResolvedAddr;
 use azalea_world::Worlds;
@@ -74,7 +78,7 @@ pub enum SwarmEvent {
     /// from this event.
     ///
     /// [`SwarmBuilder::reconnect_delay`]: crate::swarm::SwarmBuilder::reconnect_after
-    Disconnect(Box<Account>, Box<JoinOpts>),
+    Disconnect(Box<Account>, Box<JoinOpts>, Option<AttemptToken>),
     /// At least one bot received a chat message.
     Chat(ChatPacket),
 }
@@ -261,6 +265,7 @@ impl Swarm {
                     .send(SwarmEvent::Disconnect(
                         Box::new(account),
                         Box::new(join_opts.clone()),
+                        bot.attempt_token(),
                     ))
                     .unwrap();
             }
@@ -330,7 +335,10 @@ impl IntoIterator for Swarm {
 
         client_entities
             .into_iter()
-            .map(|entity| Client::new(entity, self.ecs.clone()))
+            .map(|entity| {
+                let attempt_token = self.ecs.read().get::<AttemptToken>(entity).copied();
+                Client::with_optional_attempt_token(entity, self.ecs.clone(), attempt_token)
+            })
             .collect::<Box<[Client]>>()
             .into_iter()
     }
@@ -345,6 +353,60 @@ impl PluginGroup for DefaultSwarmPlugins {
         PluginGroupBuilder::start::<Self>()
             .add(chat::SwarmChatPlugin)
             .add(events::SwarmPlugin)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn swarm_disconnect_carries_the_attempt_token() {
+        let world = Arc::new(RwLock::new(bevy_ecs::world::World::new()));
+        let entity = world.write().spawn_empty().id();
+        let account = Account::offline("probe-bot");
+        world.write().entity_mut(entity).insert(account.clone());
+
+        let token = AttemptToken::mint();
+        let bot = Client::new_with_attempt_token(entity, world.clone(), token);
+
+        let (swarm_tx, mut swarm_rx) = mpsc::unbounded_channel::<SwarmEvent>();
+        let (bots_tx, _bots_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<crate::Event>();
+        let join_opts = JoinOpts::default();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let copying = tokio::spawn(Swarm::event_copying_task(
+                event_rx,
+                swarm_tx,
+                bots_tx,
+                bot.clone(),
+                join_opts,
+            ));
+
+            event_tx.send(crate::Event::Disconnect(None)).unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), swarm_rx.recv())
+                .await
+                .expect("swarm disconnect must be delivered")
+                .expect("swarm channel stays alive");
+            drop(event_tx);
+            copying.await.expect("event copying task must finish");
+
+            match event {
+                SwarmEvent::Disconnect(event_account, _join_opts, event_token) => {
+                    assert_eq!(event_account.username(), account.username());
+                    assert_eq!(event_account.uuid(), account.uuid());
+                    assert_eq!(
+                        event_token,
+                        Some(token),
+                        "SwarmEvent::Disconnect must carry the attempt token, not a current-entity lookup"
+                    );
+                }
+                other => panic!("expected SwarmEvent::Disconnect, got {other:?}"),
+            }
+        });
     }
 }
 

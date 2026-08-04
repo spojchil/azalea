@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use azalea_chat::FormattedText;
-use azalea_client::join::ConnectionFailedEvent;
+use azalea_client::join::{AttemptToken, ConnectionFailedEvent};
 use azalea_core::{entity_id::MinecraftEntityId, position::ChunkPos, tick::GameTick};
 use azalea_entity::{Dead, InLoadedChunk};
 use azalea_protocol::{
@@ -25,6 +25,21 @@ use crate::{
     },
     player::PlayerInfo,
 };
+
+/// Returns whether an event's attempt identity matches the entity's current
+/// attempt. A tokenless event is only honored when the entity is also
+/// tokenless (legacy/test path); an event with a token is never matched
+/// against "whatever the entity has right now".
+pub(crate) fn attempt_matches_current(
+    event_attempt: Option<AttemptToken>,
+    current_attempt: Option<&AttemptToken>,
+) -> bool {
+    match (event_attempt, current_attempt) {
+        (Some(event_token), Some(current_token)) => event_token == *current_token,
+        (None, None) => true,
+        _ => false,
+    }
+}
 
 // (for contributors):
 // HOW TO ADD A NEW (packet based) EVENT:
@@ -230,11 +245,13 @@ pub fn tick_listener(query: Query<&LocalPlayerEvents, With<WorldName>>) {
 
 #[cfg(feature = "packet-event")]
 pub fn packet_listener(
-    query: Query<&LocalPlayerEvents>,
+    query: Query<(&LocalPlayerEvents, Option<&AttemptToken>)>,
     mut events: MessageReader<super::packet::game::ReceiveGamePacketEvent>,
 ) {
     for event in events.read() {
-        if let Ok(local_player_events) = query.get(event.entity) {
+        if let Ok((local_player_events, current_attempt)) = query.get(event.entity)
+            && attempt_matches_current(Some(event.attempt_token), current_attempt)
+        {
             let _ = local_player_events.send(Event::Packet(event.packet.clone()));
         }
     }
@@ -297,22 +314,26 @@ pub fn keepalive_listener(keep_alive: On<KeepAliveEvent>, query: Query<&LocalPla
 }
 
 pub fn disconnect_listener(
-    query: Query<&LocalPlayerEvents>,
+    query: Query<(&LocalPlayerEvents, Option<&AttemptToken>)>,
     mut events: MessageReader<DisconnectEvent>,
 ) {
     for event in events.read() {
-        if let Ok(local_player_events) = query.get(event.entity) {
+        if let Ok((local_player_events, current_attempt)) = query.get(event.entity)
+            && attempt_matches_current(event.attempt_token, current_attempt)
+        {
             let _ = local_player_events.send(Event::Disconnect(event.reason.clone()));
         }
     }
 }
 
 pub fn connection_failed_listener(
-    query: Query<&LocalPlayerEvents>,
+    query: Query<(&LocalPlayerEvents, Option<&AttemptToken>)>,
     mut events: MessageReader<ConnectionFailedEvent>,
 ) {
     for event in events.read() {
-        if let Ok(local_player_events) = query.get(event.entity) {
+        if let Ok((local_player_events, current_attempt)) = query.get(event.entity)
+            && attempt_matches_current(Some(event.attempt_token), current_attempt)
+        {
             let _ = local_player_events.send(Event::ConnectionFailed(event.error.clone()));
         }
     }
@@ -329,5 +350,124 @@ pub fn receive_chunk_listener(
                 event.packet.z,
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_listener_app() -> App {
+        let mut app = App::new();
+        app.add_message::<crate::packet::game::ReceiveGamePacketEvent>()
+            .add_message::<DisconnectEvent>()
+            .add_message::<ConnectionFailedEvent>()
+            .add_systems(
+                Update,
+                (
+                    #[cfg(feature = "packet-event")]
+                    packet_listener,
+                    disconnect_listener,
+                    connection_failed_listener,
+                ),
+            );
+        app
+    }
+
+    fn set_health_packet() -> azalea_protocol::packets::game::ClientboundGamePacket {
+        azalea_protocol::packets::game::ClientboundGamePacket::SetHealth(
+            azalea_protocol::packets::game::ClientboundSetHealth {
+                health: 15.,
+                food: 20,
+                saturation: 20.,
+            },
+        )
+    }
+
+    #[cfg(feature = "packet-event")]
+    #[test]
+    fn stale_packet_event_is_not_forwarded_to_current_channel() {
+        let mut app = event_listener_app();
+        let entity = app.world_mut().spawn_empty().id();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let current = AttemptToken::mint();
+        let stale = AttemptToken::mint();
+        app.world_mut()
+            .entity_mut(entity)
+            .insert((LocalPlayerEvents(tx), current));
+
+        app.world_mut()
+            .write_message(crate::packet::game::ReceiveGamePacketEvent {
+                entity,
+                packet: Arc::new(set_health_packet()),
+                attempt_token: stale,
+            });
+        app.update();
+        assert!(
+            rx.try_recv().is_err(),
+            "a stale A packet must never be forwarded into B's channel"
+        );
+
+        app.world_mut()
+            .write_message(crate::packet::game::ReceiveGamePacketEvent {
+                entity,
+                packet: Arc::new(set_health_packet()),
+                attempt_token: current,
+            });
+        app.update();
+        assert!(
+            matches!(rx.try_recv(), Ok(Event::Packet(_))),
+            "a matching packet must be forwarded into the current channel"
+        );
+    }
+
+    #[test]
+    fn stale_disconnect_and_connection_failed_are_not_forwarded_to_current_channel() {
+        let mut app = event_listener_app();
+        let entity = app.world_mut().spawn_empty().id();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let current = AttemptToken::mint();
+        let stale = AttemptToken::mint();
+        app.world_mut()
+            .entity_mut(entity)
+            .insert((LocalPlayerEvents(tx), current));
+
+        app.world_mut().write_message(DisconnectEvent {
+            entity,
+            reason: None,
+            attempt_token: Some(stale),
+        });
+        app.update();
+        assert!(
+            rx.try_recv().is_err(),
+            "a stale A disconnect must never be forwarded into B's channel"
+        );
+
+        app.world_mut().write_message(DisconnectEvent {
+            entity,
+            reason: None,
+            attempt_token: Some(current),
+        });
+        app.update();
+        assert!(matches!(rx.try_recv(), Ok(Event::Disconnect(None))));
+
+        app.world_mut().write_message(ConnectionFailedEvent {
+            entity,
+            error: Arc::new(ConnectionError::Io(std::io::Error::other("probe"))),
+            attempt_token: stale,
+        });
+        app.update();
+        assert!(
+            rx.try_recv().is_err(),
+            "a stale A connection failure must never be forwarded into B's channel"
+        );
+
+        app.world_mut().write_message(ConnectionFailedEvent {
+            entity,
+            error: Arc::new(ConnectionError::Io(std::io::Error::other("probe"))),
+            attempt_token: current,
+        });
+        app.update();
+        assert!(matches!(rx.try_recv(), Ok(Event::ConnectionFailed(_))));
     }
 }

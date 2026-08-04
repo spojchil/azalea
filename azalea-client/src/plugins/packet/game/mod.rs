@@ -39,6 +39,7 @@ use crate::{
     disconnect::DisconnectEvent,
     interact::BlockStatePredictionHandler,
     inventory::{ClientsideCloseContainerEvent, MenuOpenedEvent, SetContainerContentEvent},
+    join::AttemptToken,
     local_player::{Experience, Hunger, LocalGameMode, TabList, WorldHolder},
     movement::{KnockbackData, KnockbackEvent},
     packet::{
@@ -49,8 +50,17 @@ use crate::{
     tick_counter::TicksConnected,
 };
 
-pub fn process_packet(ecs: &mut World, player: Entity, packet: &ClientboundGamePacket) {
-    let mut handler = GamePacketHandler { player, ecs };
+pub fn process_packet(
+    ecs: &mut World,
+    player: Entity,
+    packet: &ClientboundGamePacket,
+    attempt_token: AttemptToken,
+) {
+    let mut handler = GamePacketHandler {
+        player,
+        ecs,
+        attempt_token,
+    };
 
     // the order of these doesn't matter, that's decided by the protocol library
     declare_packet_handlers!(
@@ -206,6 +216,8 @@ pub fn process_packet(ecs: &mut World, player: Entity, packet: &ClientboundGameP
 pub struct GamePacketHandler<'a> {
     pub ecs: &'a mut World,
     pub player: Entity,
+    /// The join attempt whose connection is being processed.
+    pub attempt_token: AttemptToken,
 }
 impl GamePacketHandler<'_> {
     pub fn login(&mut self, p: &ClientboundLogin) {
@@ -276,6 +288,7 @@ impl GamePacketHandler<'_> {
                         entity: self.player,
                         name: new_world_name.clone(),
                         world: Arc::downgrade(&weak_world),
+                        attempt_token: self.attempt_token,
                     });
                 }
 
@@ -406,6 +419,7 @@ impl GamePacketHandler<'_> {
             events.write(DisconnectEvent {
                 entity: self.player,
                 reason: Some(p.reason.clone()),
+                attempt_token: Some(self.attempt_token),
             });
         });
     }
@@ -1417,6 +1431,7 @@ impl GamePacketHandler<'_> {
                         entity: self.player,
                         name: new_world_name.clone(),
                         world: Arc::downgrade(&weak_world),
+                        attempt_token: self.attempt_token,
                     });
                 }
 

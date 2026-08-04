@@ -32,6 +32,7 @@ use tracing::{debug, error, info, trace};
 use super::packet::{
     config::ReceiveConfigPacketEvent, game::ReceiveGamePacketEvent, login::ReceiveLoginPacketEvent,
 };
+use crate::join::AttemptToken;
 use crate::packet::{config, game, login};
 
 pub struct ConnectionPlugin;
@@ -71,11 +72,17 @@ pub fn read_packets(ecs: &mut World) {
         for raw_packet in raw_packets {
             let conn = conn_query.get(ecs, entity).unwrap();
             let state = conn.state;
+            let attempt_token = conn.attempt_token();
 
             trace!("Received injected packet with bytes: {raw_packet:?}");
-            if let Err(e) =
-                handle_raw_packet(ecs, &raw_packet, entity, state, &mut queued_packet_events)
-            {
+            if let Err(e) = handle_raw_packet(
+                ecs,
+                &raw_packet,
+                entity,
+                state,
+                attempt_token,
+                &mut queued_packet_events,
+            ) {
                 error!("Error reading injected packet: {e}");
             }
         }
@@ -87,6 +94,7 @@ pub fn read_packets(ecs: &mut World) {
             let net_conn = conn.net_conn().unwrap();
             let read_res = net_conn.reader.try_read();
             let state = conn.state;
+            let attempt_token = conn.attempt_token();
             match read_res {
                 Ok(Some(raw_packet)) => {
                     let raw_packet = Arc::<[u8]>::from(raw_packet);
@@ -95,6 +103,7 @@ pub fn read_packets(ecs: &mut World) {
                         &raw_packet,
                         entity,
                         state,
+                        attempt_token,
                         &mut queued_packet_events,
                     ) {
                         error!("Error reading packet: {e}");
@@ -187,12 +196,16 @@ pub struct RawConnection {
     /// It's basically a way to make our client think it received a packet from
     /// the server without needing to interact with the network.
     pub injected_clientbound_packets: Vec<Box<[u8]>>,
+    /// The join attempt that installed this connection. Events produced from
+    /// this connection are stamped with this identity at the production site.
+    attempt_token: AttemptToken,
 }
 impl RawConnection {
     pub fn new(
         reader: RawReadConnection,
         writer: RawWriteConnection,
         state: ConnectionProtocol,
+        attempt_token: AttemptToken,
     ) -> Self {
         let task_pool = IoTaskPool::get();
 
@@ -202,7 +215,7 @@ impl RawConnection {
         let writer_task =
             task_pool.spawn(write_task(network_packet_writer_rx, writer.write_stream));
 
-        let mut conn = Self::new_networkless(state);
+        let mut conn = Self::new_networkless_with_token(state, attempt_token);
         conn.network = Some(NetworkConnection {
             reader,
             enc_cipher: writer.enc_cipher,
@@ -214,16 +227,32 @@ impl RawConnection {
     }
 
     pub fn new_networkless(state: ConnectionProtocol) -> Self {
+        // Legacy/test convenience constructor: each networkless connection is
+        // its own identity, so a fresh token is minted per object. Production
+        // join attempts pass their attempt token to `RawConnection::new`.
+        Self::new_networkless_with_token(state, AttemptToken::mint())
+    }
+
+    pub fn new_networkless_with_token(
+        state: ConnectionProtocol,
+        attempt_token: AttemptToken,
+    ) -> Self {
         Self {
             network: None,
             state,
             is_alive: true,
             injected_clientbound_packets: Vec::new(),
+            attempt_token,
         }
     }
 
     pub fn is_alive(&self) -> bool {
         self.is_alive
+    }
+
+    /// The immutable join-attempt identity of this connection.
+    pub fn attempt_token(&self) -> AttemptToken {
+        self.attempt_token
     }
 
     /// Write a packet to the server without emitting any events.
@@ -261,8 +290,25 @@ pub fn handle_raw_packet(
     raw_packet: &[u8],
     entity: Entity,
     state: ConnectionProtocol,
+    attempt_token: AttemptToken,
     queued_packet_events: &mut QueuedPacketEvents,
 ) -> Result<(), Box<ReadPacketError>> {
+    // Fail-closed source admission. A packet may only be deserialized and
+    // processed when the entity's current attempt token is exactly the token
+    // of the connection that produced it. During entity reuse, a stale A
+    // `RawConnection` can still be attached while the entity's current
+    // attempt is already B; such packets must be ignored before any
+    // deserialization or ECS mutation (which could otherwise drive derived
+    // events/Added components into B's channel). An entity that is missing or
+    // tokenless is also ignored; legacy packets are never back-stamped from
+    // the current attempt.
+    let Some(current_attempt_token) = ecs.get::<AttemptToken>(entity).copied() else {
+        return Ok(());
+    };
+    if current_attempt_token != attempt_token {
+        return Ok(());
+    }
+
     let stream = &mut Cursor::new(raw_packet);
     match state {
         ConnectionProtocol::Handshake => {
@@ -271,10 +317,12 @@ pub fn handle_raw_packet(
         ConnectionProtocol::Game => {
             let packet = Arc::new(deserialize_packet::<ClientboundGamePacket>(stream)?);
             trace!("Packet: {packet:?}");
-            game::process_packet(ecs, entity, packet.as_ref());
-            queued_packet_events
-                .game
-                .push(ReceiveGamePacketEvent { entity, packet });
+            game::process_packet(ecs, entity, packet.as_ref(), attempt_token);
+            queued_packet_events.game.push(ReceiveGamePacketEvent {
+                entity,
+                packet,
+                attempt_token,
+            });
         }
         ConnectionProtocol::Status => {
             unreachable!()
@@ -282,7 +330,7 @@ pub fn handle_raw_packet(
         ConnectionProtocol::Login => {
             let packet = Arc::new(deserialize_packet::<ClientboundLoginPacket>(stream)?);
             trace!("Packet: {packet:?}");
-            login::process_packet(ecs, entity, &packet);
+            login::process_packet(ecs, entity, &packet, attempt_token);
             queued_packet_events
                 .login
                 .push(ReceiveLoginPacketEvent { entity, packet });
@@ -290,7 +338,7 @@ pub fn handle_raw_packet(
         ConnectionProtocol::Configuration => {
             let packet = Arc::new(deserialize_packet::<ClientboundConfigPacket>(stream)?);
             trace!("Packet: {packet:?}");
-            config::process_packet(ecs, entity, &packet);
+            config::process_packet(ecs, entity, &packet, attempt_token);
             queued_packet_events
                 .config
                 .push(ReceiveConfigPacketEvent { entity, packet });
@@ -369,6 +417,153 @@ async fn write_task(
     }
 
     trace!("write task is done");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::local_player::Hunger;
+    use azalea_entity::metadata::Health;
+    use azalea_protocol::write::serialize_packet;
+
+    fn set_health_bytes(health: f32) -> Box<[u8]> {
+        serialize_packet(
+            &azalea_protocol::packets::game::ClientboundSetHealth {
+                health,
+                food: 20,
+                saturation: 20.,
+            }
+            .into_variant(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stale_attempt_packets_are_ignored_before_parsing() {
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let token_a = AttemptToken::mint();
+        let token_b = AttemptToken::mint();
+        world.entity_mut(entity).insert((
+            token_b,
+            Health(10.),
+            Hunger {
+                food: 5,
+                saturation: 5.,
+            },
+        ));
+
+        // Invalid bytes with the stale A token: safely ignored, nothing
+        // queued, and the parser is never reached.
+        let mut queued = QueuedPacketEvents::default();
+        let result = handle_raw_packet(
+            &mut world,
+            &[0xFF],
+            entity,
+            ConnectionProtocol::Game,
+            token_a,
+            &mut queued,
+        );
+        assert!(result.is_ok());
+        assert!(queued.game.is_empty());
+        assert_eq!(world.get::<Health>(entity).unwrap().0, 10.);
+
+        // The same invalid bytes with the matching B token reach the parser
+        // and produce an error, proving the stale branch short-circuits before
+        // deserialization.
+        let result = handle_raw_packet(
+            &mut world,
+            &[0xFF],
+            entity,
+            ConnectionProtocol::Game,
+            token_b,
+            &mut queued,
+        );
+        assert!(
+            result.is_err(),
+            "a matching token must reach the parser and fail on invalid bytes"
+        );
+    }
+
+    #[test]
+    fn missing_or_tokenless_entities_are_fail_closed() {
+        let mut world = World::new();
+        let token = AttemptToken::mint();
+
+        let tokenless = world.spawn_empty().id();
+        let mut queued = QueuedPacketEvents::default();
+        let result = handle_raw_packet(
+            &mut world,
+            &[0xFF],
+            tokenless,
+            ConnectionProtocol::Game,
+            token,
+            &mut queued,
+        );
+        assert!(result.is_ok());
+        assert!(queued.game.is_empty());
+
+        let missing = world.spawn_empty().id();
+        world.despawn(missing);
+        let result = handle_raw_packet(
+            &mut world,
+            &[0xFF],
+            missing,
+            ConnectionProtocol::Game,
+            token,
+            &mut queued,
+        );
+        assert!(result.is_ok());
+        assert!(queued.game.is_empty());
+    }
+
+    #[test]
+    fn stale_serializable_packet_does_not_mutate_ecs_and_matching_applies() {
+        let mut world = World::new();
+        let entity = world.spawn_empty().id();
+        let token_a = AttemptToken::mint();
+        let token_b = AttemptToken::mint();
+        world.entity_mut(entity).insert((
+            token_b,
+            Health(10.),
+            Hunger {
+                food: 5,
+                saturation: 5.,
+            },
+        ));
+
+        let bytes = set_health_bytes(15.);
+        let mut queued = QueuedPacketEvents::default();
+
+        let result = handle_raw_packet(
+            &mut world,
+            &bytes,
+            entity,
+            ConnectionProtocol::Game,
+            token_a,
+            &mut queued,
+        );
+        assert!(result.is_ok());
+        assert!(queued.game.is_empty());
+        assert_eq!(
+            world.get::<Health>(entity).unwrap().0,
+            10.,
+            "a stale A packet must not mutate the current attempt B's ECS"
+        );
+
+        let result = handle_raw_packet(
+            &mut world,
+            &bytes,
+            entity,
+            ConnectionProtocol::Game,
+            token_b,
+            &mut queued,
+        );
+        assert!(result.is_ok());
+        assert_eq!(queued.game.len(), 1);
+        assert_eq!(queued.game[0].attempt_token, token_b);
+        assert_eq!(world.get::<Health>(entity).unwrap().0, 15.);
+    }
 }
 
 #[derive(Debug, Error)]

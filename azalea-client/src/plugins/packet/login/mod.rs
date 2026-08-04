@@ -18,11 +18,21 @@ use tracing::{debug, error};
 use super::as_system;
 use crate::{
     InConfigState, account::Account, connection::RawConnection, cookies::RequestCookieEvent,
-    disconnect::DisconnectEvent, packet::declare_packet_handlers, player::GameProfileComponent,
+    disconnect::DisconnectEvent, join::AttemptToken, packet::declare_packet_handlers,
+    player::GameProfileComponent,
 };
 
-pub fn process_packet(ecs: &mut World, player: Entity, packet: &ClientboundLoginPacket) {
-    let mut handler = LoginPacketHandler { player, ecs };
+pub fn process_packet(
+    ecs: &mut World,
+    player: Entity,
+    packet: &ClientboundLoginPacket,
+    attempt_token: AttemptToken,
+) {
+    let mut handler = LoginPacketHandler {
+        player,
+        ecs,
+        attempt_token,
+    };
 
     declare_packet_handlers!(
         ClientboundLoginPacket,
@@ -47,6 +57,8 @@ pub struct InLoginState;
 pub struct LoginPacketHandler<'a> {
     pub ecs: &'a mut World,
     pub player: Entity,
+    /// The join attempt whose connection is being processed.
+    pub attempt_token: AttemptToken,
 }
 impl LoginPacketHandler<'_> {
     pub fn hello(&mut self, p: &ClientboundHello) {
@@ -73,6 +85,7 @@ impl LoginPacketHandler<'_> {
             events.write(DisconnectEvent {
                 entity: self.player,
                 reason: Some(p.reason.clone()),
+                attempt_token: Some(self.attempt_token),
             });
         });
     }

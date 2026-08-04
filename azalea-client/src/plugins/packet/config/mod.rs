@@ -17,6 +17,7 @@ use crate::{
     connection::RawConnection,
     cookies::{RequestCookieEvent, StoreCookieEvent},
     disconnect::DisconnectEvent,
+    join::AttemptToken,
     local_player::WorldHolder,
     packet::game::{KeepAliveEvent, ResourcePackEvent},
 };
@@ -25,14 +26,24 @@ pub fn process_raw_packet(
     ecs: &mut World,
     player: Entity,
     raw_packet: &[u8],
+    attempt_token: AttemptToken,
 ) -> Result<(), Box<ReadPacketError>> {
     let packet = deserialize_packet(&mut Cursor::new(raw_packet))?;
-    process_packet(ecs, player, &packet);
+    process_packet(ecs, player, &packet, attempt_token);
     Ok(())
 }
 
-pub fn process_packet(ecs: &mut World, player: Entity, packet: &ClientboundConfigPacket) {
-    let mut handler = ConfigPacketHandler { player, ecs };
+pub fn process_packet(
+    ecs: &mut World,
+    player: Entity,
+    packet: &ClientboundConfigPacket,
+    attempt_token: AttemptToken,
+) {
+    let mut handler = ConfigPacketHandler {
+        player,
+        ecs,
+        attempt_token,
+    };
 
     declare_packet_handlers!(
         ClientboundConfigPacket,
@@ -66,6 +77,8 @@ pub fn process_packet(ecs: &mut World, player: Entity, packet: &ClientboundConfi
 pub struct ConfigPacketHandler<'a> {
     pub ecs: &'a mut World,
     pub player: Entity,
+    /// The join attempt whose connection is being processed.
+    pub attempt_token: AttemptToken,
 }
 impl ConfigPacketHandler<'_> {
     pub fn registry_data(&mut self, p: &ClientboundRegistryData) {
@@ -90,6 +103,7 @@ impl ConfigPacketHandler<'_> {
             events.write(DisconnectEvent {
                 entity: self.player,
                 reason: Some(p.reason.clone()),
+                attempt_token: Some(self.attempt_token),
             });
         });
     }
