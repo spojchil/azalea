@@ -11,7 +11,9 @@ use parking_lot::RwLock;
 use tracing::{error, trace};
 use uuid::Uuid;
 
-use crate::{client::InGameState, connection::RawConnection, player::PlayerInfo};
+use crate::{
+    client::InGameState, connection::RawConnection, join::AttemptToken, player::PlayerInfo,
+};
 
 /// An event that's sent when we receive a packet.
 /// ```
@@ -20,7 +22,12 @@ use crate::{client::InGameState, connection::RawConnection, player::PlayerInfo};
 /// # use bevy_ecs::message::MessageReader;
 ///
 /// fn handle_packets(mut events: MessageReader<ReceiveGamePacketEvent>) {
-///     for ReceiveGamePacketEvent { entity, packet } in events.read() {
+///     for ReceiveGamePacketEvent {
+///         entity,
+///         packet,
+///         ..
+///     } in events.read()
+///     {
 ///         match packet.as_ref() {
 ///             ClientboundGamePacket::LevelParticles(p) => {
 ///                 // ...
@@ -36,6 +43,8 @@ pub struct ReceiveGamePacketEvent {
     pub entity: Entity,
     /// The packet that was actually received.
     pub packet: Arc<ClientboundGamePacket>,
+    /// The join attempt whose connection produced this packet.
+    pub attempt_token: AttemptToken,
 }
 
 /// An event for sending a packet to the server while we're in the `game` state.
@@ -146,6 +155,8 @@ pub struct WorldLoadedEvent {
     pub entity: Entity,
     pub name: WorldName,
     pub world: Weak<RwLock<World>>,
+    /// The join attempt whose connection produced this world load.
+    pub attempt_token: AttemptToken,
 }
 #[deprecated = "renamed to `WorldLoadedEvent`."]
 pub type InstanceLoadedEvent = WorldLoadedEvent;

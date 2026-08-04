@@ -3,6 +3,7 @@ use std::{fmt, fmt::Debug};
 use azalea_chat::FormattedText;
 use azalea_client::{
     inventory::{CloseContainerEvent, ContainerClickEvent},
+    join::AttemptToken,
     packet::game::ReceiveGamePacketEvent,
 };
 use azalea_core::position::BlockPos;
@@ -14,10 +15,14 @@ use azalea_inventory::{
 use azalea_physics::collision::BlockWithShape;
 use azalea_protocol::packets::game::ClientboundGamePacket;
 use bevy_app::{App, Plugin, Update};
-use bevy_ecs::{component::Component, prelude::MessageReader, system::Commands};
+use bevy_ecs::{
+    component::Component,
+    prelude::MessageReader,
+    system::{Commands, Query},
+};
 use derive_more::Deref;
 
-use crate::Client;
+use crate::{Client, events::attempt_matches_current};
 
 pub struct ContainerPlugin;
 impl Plugin for ContainerPlugin {
@@ -327,12 +332,69 @@ pub struct WaitingForInventoryOpen;
 pub fn handle_menu_opened_event(
     mut commands: Commands,
     mut events: MessageReader<ReceiveGamePacketEvent>,
+    current_attempt_query: Query<Option<&AttemptToken>>,
 ) {
     for event in events.read() {
+        let Ok(current_attempt) = current_attempt_query.get(event.entity) else {
+            continue;
+        };
+        if !attempt_matches_current(Some(event.attempt_token), current_attempt) {
+            continue;
+        }
         if let ClientboundGamePacket::ContainerSetContent { .. } = event.packet.as_ref() {
             commands
                 .entity(event.entity)
                 .remove::<WaitingForInventoryOpen>();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_packet_does_not_remove_current_waiting_for_inventory_open() {
+        let mut app = App::new();
+        app.add_message::<ReceiveGamePacketEvent>()
+            .add_systems(Update, handle_menu_opened_event);
+
+        let entity = app.world_mut().spawn_empty().id();
+        let current = AttemptToken::mint();
+        let stale = AttemptToken::mint();
+        app.world_mut()
+            .entity_mut(entity)
+            .insert((WaitingForInventoryOpen, current));
+
+        let content_packet = |attempt_token| ReceiveGamePacketEvent {
+            entity,
+            packet: std::sync::Arc::new(ClientboundGamePacket::ContainerSetContent(
+                azalea_protocol::packets::game::ClientboundContainerSetContent {
+                    container_id: 0,
+                    state_id: 0,
+                    items: Vec::new(),
+                    carried_item: azalea_inventory::ItemStack::Empty,
+                },
+            )),
+            attempt_token,
+        };
+
+        app.world_mut().write_message(content_packet(stale));
+        app.update();
+        assert!(
+            app.world()
+                .entity(entity)
+                .contains::<WaitingForInventoryOpen>(),
+            "a stale A packet must not mutate the current attempt B's components"
+        );
+
+        app.world_mut().write_message(content_packet(current));
+        app.update();
+        assert!(
+            !app.world()
+                .entity(entity)
+                .contains::<WaitingForInventoryOpen>(),
+            "a matching packet must clear WaitingForInventoryOpen normally"
+        );
     }
 }
