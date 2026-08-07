@@ -43,7 +43,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use azalea::{app::PluginGroup, bot::DefaultBotPlugins, prelude::*, swarm::prelude::*};
+use azalea::{
+    app::{App, AppExit, Plugin, PluginGroup},
+    bot::DefaultBotPlugins,
+    core::tick::GameTick,
+    prelude::*,
+    swarm::prelude::*,
+};
+use bevy_ecs::message::MessageWriter;
 use bevy_log::tracing_subscriber::{
     filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt,
 };
@@ -54,12 +61,65 @@ struct State;
 #[derive(Clone, Default, Resource)]
 struct SwarmState;
 
-/// Events seen by the handler so far. Used only to wait until the event stream
-/// is dense before asking to exit — the whole point is for `bots_rx` to be
-/// non-empty at the moment the world is cleared.
+/// Events seen by the handler so far. Used only to wait until the bot is
+/// settled before asking to exit.
 static EVENTS: AtomicUsize = AtomicUsize::new(0);
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// Requests `AppExit` from inside the `GameTick` schedule, which is what makes
+/// the reproduction deterministic instead of a coin flip.
+///
+/// `run_schedule_loop` (`azalea-client/src/client.rs:188-221`) does all of this
+/// under one write guard, in one pass:
+///
+/// ```text
+/// run_schedule(Update)      // packet handling -> Event::Packet
+/// run_schedule(GameTick)    // tick_listener -> Event::Tick  [events.rs:186]
+/// clear_trackers()
+/// should_exit() -> clear_all() -> return
+/// ```
+///
+/// So if `AppExit` is written *from a GameTick system*, the very same pass also
+/// ran `tick_listener`, which sends an `Event::Tick` for every bot that has a
+/// `WorldName`. The client's event channel is therefore guaranteed non-empty at
+/// the moment `clear_all()` destroys the entities.
+///
+/// What happens next stays on one thread: `event_copying_task` and
+/// `client_handler_task` are both `spawn_local` on the same `LocalSet`
+/// (`swarm/mod.rs:209`, `swarm/builder.rs:544`). When `run_schedule_loop`'s
+/// task finishes, the *same* `LocalSet::tick()` keeps draining its queue — it
+/// gets to wake and run `event_copying_task` (which forwards to `bots_tx`) and
+/// then `client_handler_task` (which picks the event up) before the outer
+/// future's `appexit_rx.await` is ever polled again. So `abort()` never gets a
+/// chance, and the handler walks into the `let ... else` with an entity that
+/// `clear_all()` already removed.
+///
+/// Asking to exit from the handler instead (`AZALEA_PROBE_EXIT_MODE=handler`)
+/// leaves it to chance: `AppExit` lands in some arbitrary `Update` pass, which
+/// may well have produced no events at all — GameTick only runs every third
+/// Update, and packets do not arrive every pass.
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+struct DeterministicExitPlugin;
+
+impl Plugin for DeterministicExitPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(GameTick, exit_when_armed);
+    }
+}
+
+fn exit_when_armed(mut app_exit: MessageWriter<AppExit>) {
+    if ARMED.load(Ordering::Acquire) {
+        app_exit.write(AppExit::Success);
+    }
+}
+
+/// `gametick` (default) is the deterministic path described on [`ARMED`];
+/// `handler` is the racy one, kept so the difference can be measured.
+fn exit_from_gametick() -> bool {
+    std::env::var("AZALEA_PROBE_EXIT_MODE").as_deref() != Ok("handler")
+}
 
 /// How many events to let through after spawning before asking for AppExit.
 const EVENTS_BEFORE_EXIT: usize = 200;
@@ -96,8 +156,13 @@ async fn handle(bot: Client, event: Event, _state: State) -> eyre::Result<()> {
                 && n >= EVENTS_BEFORE_EXIT
                 && !EXIT_REQUESTED.swap(true, Ordering::SeqCst)
             {
-                eprintln!("[probe] {n} ticks in, requesting AppExit");
-                bot.exit();
+                if exit_from_gametick() {
+                    eprintln!("[probe] {n} ticks in, arming the GameTick exit system");
+                    ARMED.store(true, Ordering::Release);
+                } else {
+                    eprintln!("[probe] {n} ticks in, requesting AppExit from the handler");
+                    bot.exit();
+                }
             }
         }
         _ => {
@@ -168,6 +233,7 @@ fn real_swarm_shutdown() {
                         azalea::DefaultPlugins
                             .build()
                             .disable::<bevy_log::LogPlugin>(),
+                        DeterministicExitPlugin,
                     ))
                     .set_handler(handle)
                     .set_swarm_handler(swarm_handle)
