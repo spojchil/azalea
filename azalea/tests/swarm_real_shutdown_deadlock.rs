@@ -1,11 +1,12 @@
-//! R4: drive the **real** `SwarmBuilder` through a real shutdown and see
-//! whether the process comes back.
+//! Regression test for the swarm client handler's shutdown deadlock: drive the
+//! **real** `SwarmBuilder` through a real shutdown and check that the process
+//! comes back.
 //!
-//! Everything else in this repo's deadlock tests reproduces the *statement
-//! sequence* of `azalea/src/swarm/builder.rs:553-564`. This one does not
-//! reproduce anything — it runs the actual `SwarmBuilder::start`, against a
-//! real server, with a real bot producing a real event stream, and then asks
-//! for `AppExit`. The chain under test is entirely inside azalea:
+//! `swarm_handler_ecs_lock.rs` copies the offending statement sequence, so it
+//! would keep passing if the fix were reverted. This one would not: it runs the
+//! actual `SwarmBuilder::start`, against a real server, with a real bot
+//! producing a real event stream, and then asks for `AppExit`. The chain it
+//! covers is entirely inside azalea:
 //!
 //! ```text
 //! bot connected, Event::Tick/Packet queueing into bots_rx

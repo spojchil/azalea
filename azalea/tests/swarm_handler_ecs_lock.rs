@@ -1,17 +1,20 @@
-//! Regression test for a re-entrant ECS lock in the swarm client handler.
+//! The re-entrant ECS lock hazard behind the swarm client handler's shutdown
+//! deadlock, and the three preconditions it needed.
 //!
 //! `SwarmBuilder::start` runs a `client_handler_task` that holds a write guard
 //! on the shared ECS (`ecs_mutex.write()`, `azalea/src/swarm/builder.rs:555`)
-//! while it looks up each bot's state component. When that lookup fails it logs
-//! an error whose *arguments* include `Client::username()` (`:560` for the
-//! first bot, `:580` for any subsequent one) — and `username()` takes a *read*
-//! guard on the very same `parking_lot::RwLock`
+//! while it looks up each bot's state component. When that lookup failed it
+//! logged an error whose *arguments* included `Client::username()` — and
+//! `username()` takes a *read* guard on the very same `parking_lot::RwLock`
 //! (`azalea/src/client_impl/entity_query.rs:313`). parking_lot's locks are not
-//! re-entrant, so the handler thread parks forever: no panic, no log line, the
-//! process simply never finishes shutting down.
+//! re-entrant, so the handler thread parked forever: no panic, no log line, the
+//! process simply never finished shutting down. Both call sites now read the
+//! component out of the guard they already hold.
 //!
-//! Three preconditions have to line up for that to fire, and each one gets its
-//! own test here:
+//! These tests copy the old statement sequence rather than calling into
+//! `builder.rs`, so they do **not** guard against a revert — that is
+//! `swarm_real_shutdown_deadlock.rs`'s job. They document the hazard and pin
+//! the three conditions it needed, each with its own test:
 //!
 //! 1. the state lookup has to miss — see
 //!    [`clear_all_makes_the_state_lookup_miss`], which shows that the
@@ -22,15 +25,9 @@
 //!    [`error_macro_evaluates_its_arguments_when_a_subscriber_is_installed`]
 //!    here and the negative case in `swarm_handler_error_macro_gate.rs`;
 //! 3. the write guard has to still be alive inside the `let ... else` block,
-//!    which is what [`error_path_parks_on_the_guard_it_already_holds`] pins
-//!    down.
-//!
-//! These tests reproduce the *statement sequence* of `swarm/builder.rs` rather
-//! than driving a real `SwarmBuilder` (that would need a live server, and
-//! `Swarm::bots_tx` is `pub(crate)` so an integration test cannot feed it), so
-//! what they establish is the shape and its preconditions — not that
-//! production reached that line. For that, see the live-run thread dumps
-//! discussed in the accompanying report.
+//!    which is what
+//!    [`taking_the_username_under_a_held_write_guard_parks_forever`] pins down,
+//!    together with its two controls.
 
 use std::{
     any::Any,
@@ -57,14 +54,19 @@ struct BotState;
 
 const USERNAME: &str = "Bot";
 
-/// How long to wait before calling a stuck handler thread deadlocked. The
-/// original run of this test used 10s; 60s is here to rule out "it was merely
-/// slow". Override with `AZALEA_DEADLOCK_TIMEOUT_SECS` when iterating.
+/// How long to wait before calling a stuck thread parked.
+///
+/// 10s is plenty for the everyday signal. That it is a genuine deadlock rather
+/// than slowness was established separately and does not need re-establishing
+/// on every run: this same sequence was still parked at 60s, 90s and 180s, and
+/// `parking_lot`'s own deadlock detector reports a one-thread cycle for it (see
+/// [`parking_lot_deadlock_detector_verdict`]). Raise with
+/// `AZALEA_DEADLOCK_TIMEOUT_SECS` to re-check that.
 fn timeout() -> Duration {
     let secs = std::env::var("AZALEA_DEADLOCK_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
+        .unwrap_or(10);
     Duration::from_secs(secs)
 }
 
@@ -138,13 +140,19 @@ fn run_with_timeout(
     done_rx.recv_timeout(waited).map_err(|_| started.elapsed())
 }
 
-/// The error path of `client_handler_task` must complete instead of parking on
-/// the lock it already holds.
+/// Pins the hazard itself: asking a `Client` for its username from inside a
+/// held ECS write guard parks the thread forever.
 ///
-/// This is the reproduction: the statement sequence below, including the
-/// `error!` call, is copied from `azalea/src/swarm/builder.rs:553-564`.
+/// This is **not** a regression test for `swarm/builder.rs` — it copies that
+/// file's old statement sequence rather than calling into it, so it would keep
+/// passing even if the fix were reverted. What it is good for is recording
+/// *why* the fix is shaped the way it is, and catching the day someone swaps
+/// the ECS lock for a re-entrant one and makes the whole concern moot.
+///
+/// The actual regression test is `swarm_real_shutdown_deadlock.rs`, which
+/// drives the real `SwarmBuilder` through a real shutdown.
 #[test]
-fn error_path_parks_on_the_guard_it_already_holds() {
+fn taking_the_username_under_a_held_write_guard_parks_forever() {
     install_error_subscriber();
     assert!(
         tracing::enabled!(Level::ERROR),
@@ -171,20 +179,19 @@ fn error_path_parks_on_the_guard_it_already_holds() {
     });
 
     match outcome {
-        Ok(Outcome::Finished) => {
-            panic!("expected the handler to deadlock, but it completed")
-        }
+        Ok(Outcome::Finished) => panic!(
+            "the re-entrant sequence completed. Either the ECS lock became re-entrant \
+             or `username()` stopped taking a read guard — in both cases the reasoning \
+             behind the fix in swarm/builder.rs no longer holds and should be revisited"
+        ),
         Ok(Outcome::Panicked(msg)) => panic!(
-            "the handler panicked instead of deadlocking, so this run proves \
-             nothing about the lock: {msg}"
+            "the sequence panicked instead of parking, so this run proves nothing \
+             about the lock: {msg}"
         ),
         Err(waited) => {
-            // This is the bug. Reported as a failure until it is fixed.
-            panic!(
-                "the swarm client handler deadlocked after {waited:?}: it asked for the \
-                 bot's username while holding the ECS write guard, and parking_lot's \
-                 RwLock is not re-entrant"
-            )
+            // Expected: parking_lot's RwLock is not re-entrant, so the write
+            // guard held above blocks the read guard `username()` asks for.
+            eprintln!("re-entrant write->read parked for {waited:?}, as expected");
         }
     }
 }
