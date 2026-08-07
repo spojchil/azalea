@@ -8,11 +8,13 @@ use std::{
     time::Duration,
 };
 
-use azalea_client::{DefaultPlugins, account::Account, start_ecs_runner};
+use azalea_client::{
+    DefaultPlugins, account::Account, player::GameProfileComponent, start_ecs_runner,
+};
 use azalea_protocol::address::{ResolvableAddr, ResolvedAddr};
 use azalea_world::Worlds;
 use bevy_app::{App, AppExit, Plugins, SubApp};
-use bevy_ecs::{component::Component, resource::Resource};
+use bevy_ecs::{component::Component, entity::Entity, resource::Resource, world::World};
 use futures::future::join_all;
 use parking_lot::RwLock;
 use tokio::{sync::mpsc, task};
@@ -557,7 +559,7 @@ where
                         let Ok(Some(first_bot_state)) = query.get(&ecs, first_bot.entity) else {
                             error!(
                                 "the first bot ({} / {}) is missing the required state component! none of the client handler functions will be called.",
-                                first_bot.username(),
+                                username_in(&ecs, first_bot.entity),
                                 first_bot.entity
                             );
                             continue;
@@ -577,7 +579,7 @@ where
                                     let Ok(Some(state)) = query.get(&ecs, bot.entity) else {
                                         error!(
                                             "one of our bots ({} / {}) is missing the required state component! its client handler function will not be called.",
-                                            bot.username(),
+                                            username_in(&ecs, bot.entity),
                                             bot.entity
                                         );
                                         continue;
@@ -602,6 +604,21 @@ where
             app_exit
         }).await
     }
+}
+
+/// Read a bot's username out of a [`World`] we already hold a guard on.
+///
+/// [`Client::username`] would be the obvious thing to call, but it takes a
+/// *read* guard on the same `RwLock` the client handler task is already holding
+/// a *write* guard on, and `parking_lot`'s locks are not re-entrant — so
+/// calling it from inside that scope parks the handler thread forever, taking
+/// the whole `LocalSet` (and with it the shutdown path) down with it.
+///
+/// [`Client::username`]: crate::Client::username
+fn username_in(ecs: &World, entity: Entity) -> String {
+    ecs.get::<GameProfileComponent>(entity)
+        .map(|profile| profile.name.clone())
+        .unwrap_or_else(|| "<unknown>".to_owned())
 }
 
 impl Default for SwarmBuilder<NoState, NoSwarmState, (), ()> {
