@@ -180,8 +180,17 @@ fn real_swarm_shutdown() {
         })
         .expect("spawn swarm runtime thread");
 
+    // 60s is already well past the point of "merely slow" — the statement-level
+    // reproduction in `swarm_handler_ecs_lock.rs` was still parked at 90s, and a
+    // clean shutdown here takes ~40s end to end. Kept configurable because the
+    // trigger is racy and sampling the hit rate wants a shorter timeout.
+    let timeout_secs: u64 = std::env::var("AZALEA_PROBE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180);
+
     let started = Instant::now();
-    match done_rx.recv_timeout(Duration::from_secs(180)) {
+    match done_rx.recv_timeout(Duration::from_secs(timeout_secs)) {
         Ok(exit) => {
             eprintln!(
                 "[probe] SwarmBuilder::start returned {exit:?} after {:?}",
