@@ -26,6 +26,22 @@ use crate::pathfinder::positions::SmallChunkSectionPos;
 
 const MAX_VIEW_DISTANCE: usize = 32;
 
+/// Where the pathfinder reads blocks from.
+///
+/// The default is the client's loaded world, which contains every chunk the
+/// server has sent — including places the bot has never looked at. Callers that
+/// must plan only over what the bot has actually observed can install their own
+/// source instead; see [`CachedWorld::with_block_source`].
+///
+/// `None` means **unknown**, which is deliberately not the same as "air":
+/// the caller decides what unknown means by what it returns. Returning
+/// [`BlockState::AIR`] makes a cell passable but not standable, which is the
+/// usual choice — a bot may walk into terrain it has not seen, but must not
+/// assume there is a floor under it.
+pub trait BlockSource: Send + Sync {
+    fn get_block_state(&self, pos: BlockPos) -> Option<BlockState>;
+}
+
 /// An efficient representation of the world used for the pathfinder.
 pub struct CachedWorld {
     /// The origin that the [`RelBlockPos`] types will be relative to.
@@ -45,6 +61,9 @@ pub struct CachedWorld {
 
     #[allow(clippy::type_complexity)]
     cached_mining_costs: UnsafeCell<Option<Box<[(RelBlockPos, f32)]>>>,
+
+    /// Installed by [`CachedWorld::with_block_source`]; `None` reads the world.
+    block_source: Option<Arc<dyn BlockSource>>,
 }
 
 // we store `PalettedContainer`s instead of `Chunk`s or `Section`s because it
@@ -146,7 +165,17 @@ impl CachedWorld {
             unbounded_chunk_cache: Default::default(),
             cached_blocks: Default::default(),
             cached_mining_costs: UnsafeCell::new(None),
+            block_source: None,
         }
+    }
+
+    /// Plan over the given source instead of the client's loaded world.
+    ///
+    /// Everything the source reports `None` for is treated as [`BlockState::AIR`]
+    /// by the bitsets below, i.e. passable but not standable.
+    pub fn with_block_source(mut self, source: Arc<dyn BlockSource>) -> Self {
+        self.block_source = Some(source);
+        self
     }
 
     // ```
@@ -241,6 +270,12 @@ impl CachedWorld {
     }
 
     fn calculate_bitsets_for_section(&self, section_pos: SmallChunkSectionPos) -> CachedSection {
+        if let Some(source) = &self.block_source {
+            return CachedSection {
+                pos: section_pos,
+                bitsets: bitsets_from_source(source.as_ref(), section_pos),
+            };
+        }
         let bitsets = self
             .with_section(section_pos, |section| {
                 let mut bitsets = SectionBitsets {
@@ -319,6 +354,9 @@ impl CachedWorld {
     }
 
     fn get_block_state_at_pos(&self, pos: BlockPos) -> BlockState {
+        if let Some(source) = &self.block_source {
+            return source.get_block_state(pos).unwrap_or_default();
+        }
         let (section_pos, section_block_pos) = (
             SmallChunkSectionPos::from(pos),
             ChunkSectionBlockPos::from(pos),
@@ -610,6 +648,53 @@ fn calculate_cached_mining_costs_index(pos: RelBlockPos) -> usize {
 }
 
 /// Whether our client could pass through this block.
+/// Build a section's bitsets by asking a [`BlockSource`] about each cell.
+///
+/// Cells the source does not know are treated as [`BlockState::AIR`]: passable,
+/// but **not standable**. That asymmetry is the point — a bot may walk into
+/// terrain it has not seen, but must never assume there is a floor under it.
+///
+/// The index encoding matches `u16::from(ChunkSectionBlockPos)`:
+/// `((y << 4) | z) << 4 | x`, with x/y/z each 0..16 inside the section.
+fn bitsets_from_source(
+    source: &dyn BlockSource,
+    section_pos: SmallChunkSectionPos,
+) -> Box<SectionBitsets> {
+    let mut bitsets = SectionBitsets {
+        passable: FastFixedBitSet::<4096>::new(),
+        solid: FastFixedBitSet::<4096>::new(),
+        standable: FastFixedBitSet::<4096>::new(),
+        water: FastFixedBitSet::<4096>::new(),
+    };
+
+    let base_x = (section_pos.x as i32) << 4;
+    let base_y = section_pos.y << 4;
+    let base_z = (section_pos.z as i32) << 4;
+
+    for i in 0..4096 {
+        let pos = BlockPos::new(
+            base_x + (i & 0xF) as i32,
+            base_y + ((i >> 8) & 0xF) as i32,
+            base_z + ((i >> 4) & 0xF) as i32,
+        );
+        // Unknown reads as air, which is passable and not standable.
+        let block_state = source.get_block_state(pos).unwrap_or_default();
+        if is_block_state_passable(block_state) {
+            bitsets.passable.set(i);
+        }
+        if is_block_state_solid(block_state) {
+            bitsets.solid.set(i);
+        }
+        if is_block_state_standable(block_state) {
+            bitsets.standable.set(i);
+        }
+        if is_block_state_water(block_state) {
+            bitsets.water.set(i);
+        }
+    }
+    Box::new(bitsets)
+}
+
 pub fn is_block_state_passable(block_state: BlockState) -> bool {
     // i already tried optimizing this by having it cache in an IntMap/FxHashMap but
     // it wasn't measurably faster
