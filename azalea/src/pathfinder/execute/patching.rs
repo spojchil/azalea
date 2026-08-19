@@ -37,10 +37,11 @@ pub fn check_for_path_obstruction(
         &WorldName,
         &Inventory,
         Option<&CustomPathfinderState>,
+        Option<&crate::pathfinder::world::PathfinderBlockSource>,
     )>,
     worlds: Res<Worlds>,
 ) {
-    query.par_iter_mut().for_each(|(entity, mut pathfinder, mut executing_path, world_name, inventory, custom_state)| {
+    query.par_iter_mut().for_each(|(entity, mut pathfinder, mut executing_path, world_name, inventory, custom_state, block_source)| {
         let Some(opts) = pathfinder.opts.clone() else {
             return;
         };
@@ -51,7 +52,13 @@ pub fn check_for_path_obstruction(
 
         // obstruction check (the path we're executing isn't possible anymore)
         let origin = executing_path.last_reached_node;
-        let cached_world = CachedWorld::new(world_lock, origin);
+        let block_source = block_source.map(|source| source.0.clone());
+        let cached_world = match &block_source {
+            Some(source) => {
+                CachedWorld::new(world_lock, origin).with_block_source(source.clone())
+            }
+            None => CachedWorld::new(world_lock, origin),
+        };
         let mining_cache = MiningCache::new(if opts.allow_mining {
             Some(inventory.inventory_menu.clone())
         } else {
@@ -120,6 +127,7 @@ pub fn check_for_path_obstruction(
             entity,
             world_lock,
             custom_state.clone(),
+            block_source.clone(),
             opts,
         );
     });
@@ -139,6 +147,7 @@ pub fn patch_path(
     entity: Entity,
     world_lock: Arc<RwLock<azalea_world::World>>,
     custom_state: CustomPathfinderState,
+    block_source: Option<Arc<dyn crate::pathfinder::world::BlockSource>>,
     opts: PathfinderOpts,
 ) {
     let patch_start = if *patch_nodes.start() == 0 {
@@ -173,6 +182,7 @@ pub fn patch_path(
         goto_id_atomic,
         mining_cache,
         custom_state,
+        block_source,
         opts: PathfinderOpts {
             min_timeout: PathfinderTimeout::Nodes(10_000),
             max_timeout: PathfinderTimeout::Nodes(10_000),

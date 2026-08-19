@@ -42,6 +42,15 @@ pub trait BlockSource: Send + Sync {
     fn get_block_state(&self, pos: BlockPos) -> Option<BlockState>;
 }
 
+/// Install a [`BlockSource`] on an entity and every pathfinder entry point will
+/// plan over it instead of the loaded world — initial search, replanning, and
+/// path patching alike.
+///
+/// Routing only some of them would be worse than routing none: the bot would
+/// plan a legal path and then patch it with knowledge it does not have.
+#[derive(bevy_ecs::component::Component, Clone)]
+pub struct PathfinderBlockSource(pub Arc<dyn BlockSource>);
+
 /// An efficient representation of the world used for the pathfinder.
 pub struct CachedWorld {
     /// The origin that the [`RelBlockPos`] types will be relative to.

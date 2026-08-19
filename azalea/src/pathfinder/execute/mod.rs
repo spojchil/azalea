@@ -260,6 +260,7 @@ pub fn timeout_movement(
         &WorldName,
         &Inventory,
         Option<&CustomPathfinderState>,
+        Option<&crate::pathfinder::world::PathfinderBlockSource>,
         Option<&mut SimulatingPathState>,
     )>,
     worlds: Res<Worlds>,
@@ -273,6 +274,7 @@ pub fn timeout_movement(
         world_name,
         inventory,
         custom_state,
+        block_source,
         simulating_path_state,
     ) in &mut query
     {
@@ -319,6 +321,7 @@ pub fn timeout_movement(
                     position,
                     world_name,
                     custom_state,
+                    block_source,
                     inventory,
                 );
                 continue;
@@ -358,6 +361,7 @@ pub fn timeout_movement(
                 position,
                 world_name,
                 custom_state,
+                block_source,
                 inventory,
             );
         }
@@ -373,6 +377,7 @@ fn patch_path_from_timeout(
     position: &Position,
     world_name: &WorldName,
     custom_state: Option<&CustomPathfinderState>,
+    block_source: Option<&crate::pathfinder::world::PathfinderBlockSource>,
     inventory: &Inventory,
 ) {
     executing_path.queued_path = None;
@@ -402,6 +407,7 @@ fn patch_path_from_timeout(
         entity,
         world_lock,
         custom_state,
+        block_source.map(|source| source.0.clone()),
         opts,
     );
     // reset last_node_reached_at so we don't immediately try to patch again

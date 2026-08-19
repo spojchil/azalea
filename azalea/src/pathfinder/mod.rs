@@ -309,6 +309,7 @@ pub fn goto_listener(
         &WorldName,
         &Inventory,
         Option<&CustomPathfinderState>,
+        Option<&world::PathfinderBlockSource>,
     )>,
     worlds: Res<Worlds>,
 ) {
@@ -323,11 +324,14 @@ pub fn goto_listener(
             world_name,
             inventory,
             custom_state,
+            block_source,
         )) = query.get_mut(event.entity)
         else {
             warn!("got goto event for an entity that can't pathfind");
             continue;
         };
+        // 借用不能逃进下面的 async move，先取成自有 Arc。
+        let block_source = block_source.map(|source| source.0.clone());
 
         // this env variable is set from the build.rs
         if env!("OPT_LEVEL") == "0" {
@@ -401,6 +405,7 @@ pub fn goto_listener(
                 goto_id_atomic: goto_id_atomic.clone(),
                 mining_cache: MiningCache::new(inventory_menu.clone()),
                 custom_state: custom_state.clone(),
+                block_source: block_source.clone(),
                 opts: PathfinderOpts {
                     min_timeout: PathfinderTimeout::Nodes(2_000),
                     max_timeout: PathfinderTimeout::Nodes(2_000),
@@ -472,6 +477,7 @@ pub fn goto_listener(
                 goto_id_atomic,
                 mining_cache,
                 custom_state,
+                block_source,
                 opts,
             })
         });
@@ -499,6 +505,8 @@ pub struct CalculatePathCtx {
     pub goto_id_atomic: Arc<AtomicUsize>,
     pub mining_cache: MiningCache,
     pub custom_state: CustomPathfinderState,
+    /// `None` plans over the loaded world; `Some` plans over that source only.
+    pub block_source: Option<Arc<dyn world::BlockSource>>,
 
     pub opts: PathfinderOpts,
 }
@@ -517,7 +525,10 @@ pub fn calculate_path(ctx: CalculatePathCtx) -> Option<PathFoundEvent> {
     let goto_id = ctx.goto_id_atomic.fetch_add(1, atomic::Ordering::SeqCst) + 1;
 
     let origin = ctx.start;
-    let cached_world = CachedWorld::new(ctx.world_lock, origin);
+    let cached_world = match ctx.block_source {
+        Some(source) => CachedWorld::new(ctx.world_lock, origin).with_block_source(source),
+        None => CachedWorld::new(ctx.world_lock, origin),
+    };
     let successors = |pos: RelBlockPos| {
         call_successors_fn(
             &cached_world,
@@ -640,13 +651,20 @@ pub fn path_found_listener(
         &WorldName,
         &Inventory,
         Option<&CustomPathfinderState>,
+        Option<&world::PathfinderBlockSource>,
     )>,
     worlds: Res<Worlds>,
     mut commands: Commands,
 ) {
     for event in events.read() {
-        let Ok((mut pathfinder, executing_path, world_name, inventory, custom_state)) =
-            query.get_mut(event.entity)
+        let Ok((
+            mut pathfinder,
+            executing_path,
+            world_name,
+            inventory,
+            custom_state,
+            block_source,
+        )) = query.get_mut(event.entity)
         else {
             debug!("got path found event for an entity that can't pathfind");
             continue;
@@ -663,7 +681,12 @@ pub fn path_found_listener(
                         .expect("Entity tried to pathfind but the entity isn't in a valid world");
                     let origin = event.start;
                     let successors_fn: moves::SuccessorsFn = event.successors_fn;
-                    let cached_world = CachedWorld::new(world_lock, origin);
+                    let cached_world = match block_source {
+                        Some(source) => {
+                            CachedWorld::new(world_lock, origin).with_block_source(source.0.clone())
+                        }
+                        None => CachedWorld::new(world_lock, origin),
+                    };
                     let mining_cache = MiningCache::new(if event.allow_mining {
                         Some(inventory.inventory_menu.clone())
                     } else {
