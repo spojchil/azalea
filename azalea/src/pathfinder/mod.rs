@@ -141,6 +141,15 @@ pub struct ExecutingPath {
     // and our ticks take a while
     pub ticks_since_last_node_reached: usize,
     pub is_path_partial: bool,
+    /// Whether the plan that produced this path was allowed to mine.
+    ///
+    /// The executor must not be more permissive than the planner: a path
+    /// computed with mining forbidden may still walk into a block the planner
+    /// believed was air, and breaking it would be an action the caller never
+    /// authorized. Carried per-path rather than read from [`Pathfinder::opts`]
+    /// because the opts are cleared on retirement while the path is still
+    /// executing.
+    pub allow_mining: bool,
 }
 impl ExecutingPath {
     pub fn is_empty_queued_path(&self) -> bool {
@@ -900,6 +909,7 @@ pub fn path_found_listener(
                 );
                 executing_path.queued_path = Some(new_path);
                 executing_path.is_path_partial = event.is_partial;
+                executing_path.allow_mining = event.allow_mining;
             } else {
                 commands.entity(event.entity).insert(ExecutingPath {
                     path: found_path.to_owned(),
@@ -907,6 +917,7 @@ pub fn path_found_listener(
                     last_reached_node: event.start,
                     ticks_since_last_node_reached: 0,
                     is_path_partial: event.is_partial,
+                    allow_mining: event.allow_mining,
                 });
                 debug!(
                     "set path to {:?}",

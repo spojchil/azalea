@@ -186,7 +186,7 @@ pub fn tick_execute_path(
                         start: executing_path.last_reached_node,
                         physics,
                         is_currently_mining: mining.is_some(),
-                        can_mine: true,
+                        can_mine: executing_path.allow_mining,
                         world: world_holder.shared.clone(),
                         menu: inventory.inventory_menu.clone(),
 

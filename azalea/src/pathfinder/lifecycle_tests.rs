@@ -411,6 +411,7 @@ fn timeout_does_not_patch_an_old_leg_after_replacement_listener_consumption() {
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 41,
         is_path_partial: false,
+        allow_mining: false,
     });
     let ecs = detach_app_world(&mut app);
     let client = Client::new(entity, ecs.clone());
@@ -451,6 +452,7 @@ fn obstruction_does_not_patch_an_old_leg_after_replacement_listener_consumption(
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 17,
         is_path_partial: false,
+        allow_mining: false,
     });
     let ecs = detach_app_world(&mut app);
     let client = Client::new(entity, ecs.clone());
@@ -491,6 +493,7 @@ fn force_retire_synchronously_invalidates_a_queued_client_goto() {
             last_reached_node: current,
             ticks_since_last_node_reached: 0,
             is_path_partial: false,
+            allow_mining: false,
         },
         ComputePath(AsyncComputeTaskPool::get().spawn(async { None })),
     ));
@@ -563,6 +566,7 @@ fn empty_current_path_is_removed_and_stops_walking() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
+                allow_mining: false,
             },
             WorldName::new("minecraft:overworld"),
             Inventory::default(),
@@ -604,6 +608,7 @@ fn empty_partial_result_with_retry_disabled_stops_after_the_current_movement() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
+                allow_mining: false,
             },
             WorldName::new("minecraft:overworld"),
             Inventory::default(),
@@ -661,6 +666,7 @@ fn partial_recalculation_can_be_disabled_without_dropping_patch_opts() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
+                allow_mining: false,
             },
         ))
         .id();
@@ -698,6 +704,7 @@ fn an_empty_partial_segment_is_retired_when_recalculation_is_disabled() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
+                allow_mining: false,
             },
         ))
         .id();
@@ -735,6 +742,7 @@ fn an_empty_old_segment_does_not_clear_a_replacement_calculation() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
+                allow_mining: false,
             },
         ))
         .id();
@@ -773,6 +781,7 @@ fn an_empty_old_segment_does_not_retire_a_queued_replacement() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
+                allow_mining: false,
             },
         ))
         .id();
@@ -800,6 +809,7 @@ fn timeout_patching_preserves_a_graceful_stop_sentinel() {
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 41,
         is_path_partial: true,
+        allow_mining: false,
     };
 
     let pending = graceful_stop_pending(&pathfinder, &executing);
@@ -834,6 +844,7 @@ fn an_empty_timeout_patch_completes_a_graceful_stop() {
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 41,
         is_path_partial: true,
+        allow_mining: false,
     };
     let pending = graceful_stop_pending(&pathfinder, &executing);
     executing.path.clear(); // the timeout patch found no safe replacement
@@ -859,6 +870,7 @@ fn an_empty_timeout_patch_does_not_reset_the_stall_deadline() {
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 41,
         is_path_partial: true,
+        allow_mining: false,
     };
 
     finish_timeout_patch(&mut executing, false, PatchOutcome::NoPath);
@@ -875,6 +887,7 @@ fn a_usable_timeout_patch_starts_a_new_movement_deadline() {
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 41,
         is_path_partial: true,
+        allow_mining: false,
     };
 
     finish_timeout_patch(&mut executing, false, PatchOutcome::Applied);
@@ -968,4 +981,53 @@ fn changing_world_stops_a_calculation_without_an_executing_path() {
     assert!(pathfinder.goal.is_none());
     assert!(pathfinder.opts.is_none());
     assert!(!pathfinder.is_calculating);
+}
+
+fn mining_permission_after_path_found(allow_mining: bool) -> bool {
+    let mut app = App::new();
+    app.add_message::<PathFoundEvent>()
+        .add_message::<StartWalkEvent>()
+        .init_resource::<Worlds>()
+        .add_systems(Update, path_found_listener);
+    let pathfinder = active_pathfinder();
+    let calculation_id = next_path_calculation_id(&pathfinder.goto_id);
+    let entity = app
+        .world_mut()
+        .spawn((
+            pathfinder,
+            WorldName::new("minecraft:overworld"),
+            Inventory::default(),
+        ))
+        .id();
+    app.world_mut().write_message(PathFoundEvent {
+        entity,
+        calculation_id,
+        start: BlockPos::new(0, 64, 0),
+        path: Some(one_edge_path()),
+        is_partial: false,
+        successors_fn: moves::default_move,
+        allow_mining,
+    });
+
+    app.update();
+
+    app.world()
+        .get::<ExecutingPath>(entity)
+        .expect("a non-empty path must start executing")
+        .allow_mining
+}
+
+/// The executor must never be more permissive than the plan that produced the
+/// path. A path computed with mining forbidden can still walk into a block the
+/// planner believed was air; breaking it would be an action nobody authorized.
+#[test]
+fn executing_path_carries_the_plans_mining_permission() {
+    assert!(
+        !mining_permission_after_path_found(false),
+        "a path planned without mining must not let the executor mine"
+    );
+    assert!(
+        mining_permission_after_path_found(true),
+        "the permission must be read from the plan, not pinned to one value"
+    );
 }

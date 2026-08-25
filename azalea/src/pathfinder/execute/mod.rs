@@ -105,7 +105,7 @@ pub fn tick_execute_path(
                 start: executing_path.last_reached_node,
                 physics,
                 is_currently_mining: mining.is_some(),
-                can_mine: true,
+                can_mine: executing_path.allow_mining,
                 world: world_holder.shared.clone(),
                 menu: inventory.inventory_menu.clone(),
 
@@ -385,8 +385,7 @@ pub fn timeout_movement(
             timeout = 5 * 20;
         }
 
-        if executing_path.ticks_since_last_node_reached > timeout
-            && !executing_path.path.is_empty()
+        if executing_path.ticks_since_last_node_reached > timeout && !executing_path.path.is_empty()
         {
             warn!("pathfinder timeout, trying to patch path");
 
