@@ -100,6 +100,16 @@ impl BlockStatePredictionHandler {
         self.seq
     }
 
+    /// Return whether `pos` still has a locally predicted block state awaiting
+    /// the server's acknowledgement.
+    ///
+    /// Callers that report action outcomes should not treat the current world
+    /// value as server-confirmed while this is true: an acknowledgement may
+    /// still keep it or roll it back.
+    pub fn is_prediction_pending(&self, pos: BlockPos) -> bool {
+        self.server_state.contains_key(&pos)
+    }
+
     /// Should be called right before the client updates a block with its
     /// prediction.
     ///
@@ -163,6 +173,25 @@ impl BlockStatePredictionHandler {
         for pos in to_remove {
             self.server_state.remove(&pos);
         }
+    }
+}
+
+#[cfg(test)]
+mod prediction_tests {
+    use azalea_registry::builtin::BlockKind;
+
+    use super::*;
+
+    #[test]
+    fn pending_prediction_is_visible_until_the_ack_sequence_ends_it() {
+        let pos = BlockPos::new(1, 64, 2);
+        let mut handler = BlockStatePredictionHandler::default();
+        let seq = handler.start_predicting();
+        handler.retain_known_server_state(pos, BlockKind::Stone.into(), Vec3::ZERO);
+
+        assert!(handler.is_prediction_pending(pos));
+        handler.end_prediction_up_to(seq, &World::default());
+        assert!(!handler.is_prediction_pending(pos));
     }
 }
 
