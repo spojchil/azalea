@@ -1,5 +1,8 @@
 use azalea_block::{BlockState, BlockTrait, fluid_state::FluidState};
-use azalea_core::{direction::Direction, game_type::GameMode, position::BlockPos, tick::GameTick};
+use azalea_core::{
+    direction::Direction, game_type::GameMode, hit_result::HitResult, position::BlockPos,
+    tick::GameTick,
+};
 use azalea_entity::{
     ActiveEffects, Attributes, FluidOnEyes, Physics, PlayerAbilities, Position,
     inventory::Inventory, mining::get_mine_progress,
@@ -154,6 +157,61 @@ pub struct StartMiningBlockEvent {
     /// preferable if you're trying to act like vanilla).
     pub force: bool,
 }
+
+/// Pick the packet face used by a forced mining request.
+///
+/// A matching, non-miss crosshair hit provides the real face. Forced requests
+/// are allowed to name another block, in which case the face is arbitrary and
+/// follows vanilla Azalea's existing [`Direction::Down`] fallback.
+pub fn forced_mining_direction(hit_result: &HitResult, position: BlockPos) -> Direction {
+    if let Some(block_hit_result) = hit_result.as_block_hit_result_if_not_miss()
+        && block_hit_result.block_pos == position
+    {
+        block_hit_result.direction
+    } else {
+        debug!(
+            "Forced mining request does not match the current hit ({hit_result:?}.block_pos != {position:?}); using an arbitrary direction."
+        );
+        Direction::Down
+    }
+}
+
+#[cfg(test)]
+mod direction_tests {
+    use azalea_core::{
+        hit_result::BlockHitResult,
+        position::{BlockPos, Vec3},
+    };
+
+    use super::*;
+
+    #[test]
+    fn forced_direction_uses_a_matching_hit_face_only() {
+        let target = BlockPos::new(1, 64, 2);
+        let hit = HitResult::Block(BlockHitResult {
+            location: Vec3::new(1.5, 64.5, 2.0),
+            miss: false,
+            direction: Direction::North,
+            block_pos: target,
+            inside: false,
+            world_border: false,
+        });
+
+        assert_eq!(forced_mining_direction(&hit, target), Direction::North);
+        assert_eq!(
+            forced_mining_direction(&hit, BlockPos::new(2, 64, 2)),
+            Direction::Down
+        );
+        assert_eq!(
+            forced_mining_direction(
+                &HitResult::new_miss(Vec3::ZERO, Direction::Up, target),
+                target,
+            ),
+            Direction::Down
+        );
+    }
+}
+
 fn handle_start_mining_block_event(
     mut commands: Commands,
     mut events: MessageReader<StartMiningBlockEvent>,
@@ -163,20 +221,7 @@ fn handle_start_mining_block_event(
         trace!("{event:?}");
         let hit_result = query.get_mut(event.entity).unwrap();
         if event.force {
-            let direction = if let Some(block_hit_result) =
-                hit_result.as_block_hit_result_if_not_miss()
-                && block_hit_result.block_pos == event.position
-            {
-                // we're looking at the block
-                block_hit_result.direction
-            } else {
-                debug!(
-                    "Got StartMiningBlockEvent but we're not looking at the block ({hit_result:?}.block_pos != {:?}). Picking an arbitrary direction instead.",
-                    event.position
-                );
-                // we're not looking at the block, arbitrary direction
-                Direction::Down
-            };
+            let direction = forced_mining_direction(hit_result, event.position);
             commands.entity(event.entity).insert(MiningQueued {
                 position: event.position,
                 direction,
@@ -219,6 +264,7 @@ pub fn handle_mining_queued(
     query: Query<(
         Entity,
         &MiningQueued,
+        Option<&HitResultComponent>,
         &WorldHolder,
         &LocalGameMode,
         &Inventory,
@@ -240,6 +286,7 @@ pub fn handle_mining_queued(
     for (
         entity,
         mining_queued,
+        hit_result,
         world_holder,
         game_mode,
         inventory,
@@ -260,6 +307,18 @@ pub fn handle_mining_queued(
     {
         trace!("handle_mining_queued {mining_queued:?}");
         commands.entity(entity).remove::<MiningQueued>();
+
+        // A synchronous external request may have been queued immediately after a
+        // LookAtEvent. Re-evaluate force=true at consumption time so it keeps
+        // the event API's established semantics: the latest matching crosshair
+        // hit supplies the real packet face.
+        let direction = if mining_queued.force {
+            hit_result.map_or(mining_queued.direction, |hit_result| {
+                forced_mining_direction(hit_result, mining_queued.position)
+            })
+        } else {
+            mining_queued.direction
+        };
 
         let world = world_holder.shared.read();
         if check_is_interaction_restricted(
@@ -288,7 +347,7 @@ pub fn handle_mining_queued(
                 ServerboundPlayerAction {
                     action: s_player_action::Action::StartDestroyBlock,
                     pos: mining_queued.position,
-                    direction: mining_queued.direction,
+                    direction,
                     seq: sequence_number.start_predicting(),
                 },
             ));
@@ -314,7 +373,7 @@ pub fn handle_mining_queued(
                         action: s_player_action::Action::AbortDestroyBlock,
                         pos: current_mining_pos
                             .expect("IsMining is true so MineBlockPos must be present"),
-                        direction: mining_queued.direction,
+                        direction,
                         seq: 0,
                     },
                 ));
@@ -357,7 +416,7 @@ pub fn handle_mining_queued(
             } else {
                 let mining = Mining {
                     pos: mining_queued.position,
-                    dir: mining_queued.direction,
+                    dir: direction,
                     force: mining_queued.force,
                 };
                 trace!("inserting mining component {mining:?} for entity {entity:?}");
@@ -378,7 +437,7 @@ pub fn handle_mining_queued(
                 ServerboundPlayerAction {
                     action: s_player_action::Action::StartDestroyBlock,
                     pos: mining_queued.position,
-                    direction: mining_queued.direction,
+                    direction,
                     seq: sequence_number.start_predicting(),
                 },
             ));
