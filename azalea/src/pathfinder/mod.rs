@@ -20,6 +20,8 @@ pub mod debug;
 pub mod execute;
 pub mod goals;
 mod goto_event;
+#[cfg(test)]
+mod lifecycle_tests;
 pub mod mining;
 pub mod moves;
 pub mod positions;
@@ -142,6 +144,10 @@ impl ExecutingPath {
 #[non_exhaustive]
 pub struct PathFoundEvent {
     pub entity: Entity,
+    /// The calculation generation that produced this result. Results are
+    /// checked again when they are applied so a stop or replacement that
+    /// happens after A* finishes cannot revive an obsolete path.
+    pub calculation_id: usize,
     pub start: BlockPos,
     pub path: Option<VecDeque<astar::Edge<BlockPos, moves::MoveData>>>,
     pub is_partial: bool,
@@ -301,6 +307,7 @@ pub fn goto_listener(
     mut commands: Commands,
     mut events: MessageReader<GotoEvent>,
     mut path_found_events: MessageWriter<PathFoundEvent>,
+    mut walk_events: MessageWriter<StartWalkEvent>,
     mut query: Query<(
         &mut Pathfinder,
         Option<&mut ExecutingPath>,
@@ -344,12 +351,25 @@ pub fn goto_listener(
         }
 
         let cur_pos = player_pos_to_block_pos(**position);
+        let goto_id_atomic = pathfinder.goto_id.clone();
+        // Allocate the generation on the ECS thread before spawning A*. If the
+        // task allocated it after being scheduled, an older slow-to-start task
+        // could incorrectly supersede a newer request.
+        let calculation_id = next_path_calculation_id(&goto_id_atomic);
 
         if event.goal.success(cur_pos) {
             // we're already at the goal, nothing to do
             pathfinder.goal = None;
             pathfinder.opts = None;
             pathfinder.is_calculating = false;
+            commands.entity(event.entity).remove::<ComputePath>();
+            if executing_path.is_some() {
+                commands.entity(event.entity).remove::<ExecutingPath>();
+                walk_events.write(StartWalkEvent {
+                    entity: event.entity,
+                    direction: WalkDirection::None,
+                });
+            }
             debug!("already at goal, not pathfinding");
             continue;
         }
@@ -365,8 +385,6 @@ pub fn goto_listener(
 
         let goal = event.goal.clone();
         let entity = event.entity;
-
-        let goto_id_atomic = pathfinder.goto_id.clone();
 
         let allow_mining = event.opts.allow_mining;
         let inventory_menu = if allow_mining {
@@ -397,21 +415,24 @@ pub fn goto_listener(
                         .unwrap_or(cur_pos)
                 });
 
-            let path_found_event = calculate_path(CalculatePathCtx {
-                entity,
-                start: instant_path_start,
-                goal: goal.clone(),
-                world_lock: world_lock.clone(),
-                goto_id_atomic: goto_id_atomic.clone(),
-                mining_cache: MiningCache::new(inventory_menu.clone()),
-                custom_state: custom_state.clone(),
-                block_source: block_source.clone(),
-                opts: PathfinderOpts {
-                    min_timeout: PathfinderTimeout::Nodes(2_000),
-                    max_timeout: PathfinderTimeout::Nodes(2_000),
-                    ..opts
+            let path_found_event = calculate_path_at_generation(
+                CalculatePathCtx {
+                    entity,
+                    start: instant_path_start,
+                    goal: goal.clone(),
+                    world_lock: world_lock.clone(),
+                    goto_id_atomic: goto_id_atomic.clone(),
+                    mining_cache: MiningCache::new(inventory_menu.clone()),
+                    custom_state: custom_state.clone(),
+                    block_source: block_source.clone(),
+                    opts: PathfinderOpts {
+                        min_timeout: PathfinderTimeout::Nodes(2_000),
+                        max_timeout: PathfinderTimeout::Nodes(2_000),
+                        ..opts
+                    },
                 },
-            });
+                calculation_id,
+            );
 
             if let Some(path_found_event) = path_found_event
                 && !path_found_event.is_partial
@@ -469,17 +490,20 @@ pub fn goto_listener(
 
         let mining_cache = MiningCache::new(inventory_menu);
         let task = thread_pool.spawn(async move {
-            calculate_path(CalculatePathCtx {
-                entity,
-                start,
-                goal,
-                world_lock,
-                goto_id_atomic,
-                mining_cache,
-                custom_state,
-                block_source,
-                opts,
-            })
+            calculate_path_at_generation(
+                CalculatePathCtx {
+                    entity,
+                    start,
+                    goal,
+                    world_lock,
+                    goto_id_atomic,
+                    mining_cache,
+                    custom_state,
+                    block_source,
+                    opts,
+                },
+                calculation_id,
+            )
         });
 
         commands.entity(event.entity).insert(ComputePath(task));
@@ -495,6 +519,14 @@ pub fn goto_listener(
 pub fn player_pos_to_block_pos(position: Vec3) -> BlockPos {
     // 0.5 to account for non-full blocks
     BlockPos::from(position.up(0.5))
+}
+
+// Reserve a generation before dispatching path calculation work. Allocating on
+// the caller's thread makes request ordering independent of worker scheduling.
+fn next_path_calculation_id(goto_id_atomic: &AtomicUsize) -> usize {
+    goto_id_atomic
+        .fetch_add(1, atomic::Ordering::SeqCst)
+        .wrapping_add(1)
 }
 
 pub struct CalculatePathCtx {
@@ -520,9 +552,15 @@ pub struct CalculatePathCtx {
 /// calling this function. `None` will be returned if the pathfinding was
 /// interrupted by another path calculation.
 pub fn calculate_path(ctx: CalculatePathCtx) -> Option<PathFoundEvent> {
-    debug!("start: {}", ctx.start);
+    let calculation_id = next_path_calculation_id(&ctx.goto_id_atomic);
+    calculate_path_at_generation(ctx, calculation_id)
+}
 
-    let goto_id = ctx.goto_id_atomic.fetch_add(1, atomic::Ordering::SeqCst) + 1;
+fn calculate_path_at_generation(
+    ctx: CalculatePathCtx,
+    calculation_id: usize,
+) -> Option<PathFoundEvent> {
+    debug!("start: {}", ctx.start);
 
     let origin = ctx.start;
     let cached_world = match ctx.block_source {
@@ -576,7 +614,7 @@ pub fn calculate_path(ctx: CalculatePathCtx) -> Option<PathFoundEvent> {
     let path = movements.into_iter().collect::<VecDeque<_>>();
 
     let goto_id_now = ctx.goto_id_atomic.load(atomic::Ordering::SeqCst);
-    if goto_id != goto_id_now {
+    if calculation_id != goto_id_now {
         // we must've done another goto while calculating this path, so throw it away
         warn!("finished calculating a path, but it's outdated");
         return None;
@@ -615,6 +653,7 @@ pub fn calculate_path(ctx: CalculatePathCtx) -> Option<PathFoundEvent> {
 
     Some(PathFoundEvent {
         entity: ctx.entity,
+        calculation_id,
         start: ctx.start,
         path: Some(mapped_path),
         is_partial,
@@ -655,21 +694,61 @@ pub fn path_found_listener(
     )>,
     worlds: Res<Worlds>,
     mut commands: Commands,
+    mut walk_events: MessageWriter<StartWalkEvent>,
 ) {
     for event in events.read() {
-        let Ok((
-            mut pathfinder,
-            executing_path,
-            world_name,
-            inventory,
-            custom_state,
-            block_source,
-        )) = query.get_mut(event.entity)
+        let Ok((mut pathfinder, executing_path, world_name, inventory, custom_state, block_source)) =
+            query.get_mut(event.entity)
         else {
             debug!("got path found event for an entity that can't pathfind");
             continue;
         };
+        if event.calculation_id != pathfinder.goto_id.load(atomic::Ordering::SeqCst) {
+            debug!(
+                "discarding path result from obsolete calculation {}",
+                event.calculation_id
+            );
+            continue;
+        }
         if let Some(found_path) = &event.path {
+            if found_path.is_empty() {
+                debug!("calculated path is empty");
+                let should_retry = event.is_partial
+                    && pathfinder
+                        .opts
+                        .as_ref()
+                        .is_some_and(|opts| opts.retry_on_no_path);
+                if let Some(mut executing_path) = executing_path {
+                    // An empty continuation must not queue a copy of the path
+                    // that is already being executed. Doing so can leave an
+                    // empty ExecutingPath component that never makes progress.
+                    executing_path.queued_path = None;
+                    executing_path.is_path_partial = should_retry;
+                    if executing_path.path.is_empty() {
+                        commands.entity(event.entity).remove::<ExecutingPath>();
+                        walk_events.write(StartWalkEvent {
+                            entity: event.entity,
+                            direction: WalkDirection::None,
+                        });
+                        if !should_retry {
+                            pathfinder.goal = None;
+                            pathfinder.opts = None;
+                        }
+                    } else if event.is_partial && !should_retry {
+                        // The replacement request exhausted its graph. Finish
+                        // only the movement already in flight; continuing the
+                        // retained prefix (up to 50 nodes) would execute a path
+                        // that no longer belongs to an active goal.
+                        pathfinder.goal = None;
+                        executing_path.queued_path = Some(VecDeque::new());
+                    }
+                } else if !should_retry {
+                    pathfinder.goal = None;
+                    pathfinder.opts = None;
+                }
+                pathfinder.is_calculating = false;
+                continue;
+            }
             if let Some(mut executing_path) = executing_path {
                 let mut new_path = VecDeque::new();
 
@@ -704,32 +783,27 @@ pub fn path_found_listener(
                         )
                     };
 
-                    if let Some(first_node_of_new_path) = found_path.front() {
-                        let last_target_of_current_path = RelBlockPos::from_origin(
-                            origin,
-                            last_node_of_current_path.movement.target,
-                        );
-                        let first_target_of_new_path = RelBlockPos::from_origin(
-                            origin,
-                            first_node_of_new_path.movement.target,
-                        );
+                    let first_node_of_new_path = found_path
+                        .front()
+                        .expect("empty paths are handled before path merging");
+                    let last_target_of_current_path =
+                        RelBlockPos::from_origin(origin, last_node_of_current_path.movement.target);
+                    let first_target_of_new_path =
+                        RelBlockPos::from_origin(origin, first_node_of_new_path.movement.target);
 
-                        if successors(last_target_of_current_path)
-                            .iter()
-                            .any(|edge| edge.movement.target == first_target_of_new_path)
-                        {
-                            debug!("combining old and new paths");
-                            debug!(
-                                "old path: {:?}",
-                                executing_path.path.iter().collect::<Vec<_>>()
-                            );
-                            debug!(
-                                "new path: {:?}",
-                                found_path.iter().take(10).collect::<Vec<_>>()
-                            );
-                            new_path.extend(executing_path.path.iter().cloned());
-                        }
-                    } else {
+                    if successors(last_target_of_current_path)
+                        .iter()
+                        .any(|edge| edge.movement.target == first_target_of_new_path)
+                    {
+                        debug!("combining old and new paths");
+                        debug!(
+                            "old path: {:?}",
+                            executing_path.path.iter().collect::<Vec<_>>()
+                        );
+                        debug!(
+                            "new path: {:?}",
+                            found_path.iter().take(10).collect::<Vec<_>>()
+                        );
                         new_path.extend(executing_path.path.iter().cloned());
                     }
                 }
@@ -742,12 +816,6 @@ pub fn path_found_listener(
                 );
                 executing_path.queued_path = Some(new_path);
                 executing_path.is_path_partial = event.is_partial;
-            } else if found_path.is_empty() {
-                debug!("calculated path is empty, so didn't add ExecutingPath");
-                if !pathfinder.opts.as_ref().is_some_and(|o| o.retry_on_no_path) {
-                    debug!("retry_on_no_path is set to false, removing goal");
-                    pathfinder.goal = None;
-                }
             } else {
                 commands.entity(event.entity).insert(ExecutingPath {
                     path: found_path.to_owned(),
@@ -788,7 +856,7 @@ pub struct StopPathfindingEvent {
 
 pub fn handle_stop_pathfinding_event(
     mut events: MessageReader<StopPathfindingEvent>,
-    mut query: Query<(&mut Pathfinder, &mut ExecutingPath)>,
+    mut query: Query<(&mut Pathfinder, Option<&mut ExecutingPath>)>,
     mut walk_events: MessageWriter<StartWalkEvent>,
     mut commands: Commands,
 ) {
@@ -796,43 +864,77 @@ pub fn handle_stop_pathfinding_event(
         // stop computing any path that's being computed
         commands.entity(event.entity).remove::<ComputePath>();
 
-        let Ok((mut pathfinder, mut executing_path)) = query.get_mut(event.entity) else {
+        let Ok((mut pathfinder, executing_path)) = query.get_mut(event.entity) else {
             continue;
         };
+        // Invalidate workers as well as the task component. A worker may have
+        // completed between its final check and PathFoundEvent consumption.
+        next_path_calculation_id(&pathfinder.goto_id);
         pathfinder.goal = None;
-        if event.force {
-            executing_path.path.clear();
-            executing_path.queued_path = None;
-        } else {
-            // switch to an empty path as soon as it can
-            executing_path.queued_path = Some(VecDeque::new());
-            // make sure it doesn't recalculate
-            executing_path.is_path_partial = false;
-        }
+        pathfinder.is_calculating = false;
 
-        if executing_path.path.is_empty() {
-            walk_events.write(StartWalkEvent {
-                entity: event.entity,
-                direction: WalkDirection::None,
-            });
-            commands.entity(event.entity).remove::<ExecutingPath>();
+        match executing_path {
+            Some(mut executing_path) if !event.force && !executing_path.path.is_empty() => {
+                // Finish the current movement before switching to an empty
+                // path. Keep opts until then because local patching still uses
+                // them.
+                executing_path.queued_path = Some(VecDeque::new());
+                executing_path.is_path_partial = false;
+            }
+            Some(_) => {
+                pathfinder.opts = None;
+                commands.entity(event.entity).remove::<ExecutingPath>();
+                walk_events.write(StartWalkEvent {
+                    entity: event.entity,
+                    direction: WalkDirection::None,
+                });
+            }
+            None => {
+                pathfinder.opts = None;
+                // There is no movement left to finish gracefully, so both
+                // forceful and graceful stops must clear any latched input.
+                walk_events.write(StartWalkEvent {
+                    entity: event.entity,
+                    direction: WalkDirection::None,
+                });
+            }
         }
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub fn stop_pathfinding_on_world_change(
-    mut query: Query<(Entity, &mut ExecutingPath), Changed<WorldName>>,
+    mut query: Query<
+        (
+            Entity,
+            Ref<WorldName>,
+            Option<&ExecutingPath>,
+            Option<&ComputePath>,
+            &Pathfinder,
+        ),
+        Changed<WorldName>,
+    >,
     mut stop_pathfinding_events: MessageWriter<StopPathfindingEvent>,
 ) {
-    for (entity, mut executing_path) in &mut query {
-        if !executing_path.path.is_empty() {
-            debug!("world changed, clearing path");
-            executing_path.path.clear();
-            stop_pathfinding_events.write(StopPathfindingEvent {
-                entity,
-                force: true,
-            });
+    for (entity, world_name, executing_path, compute_path, pathfinder) in &mut query {
+        // `Changed` also matches a component's initial insertion. A newly
+        // joined player has not crossed dimensions and must not have a goto
+        // from the same update canceled as a false world change.
+        if world_name.is_added() {
+            continue;
         }
+        let has_active_navigation = executing_path.is_some()
+            || compute_path.is_some()
+            || pathfinder.goal.is_some()
+            || pathfinder.is_calculating;
+        if !has_active_navigation {
+            continue;
+        }
+        debug!("world changed, stopping pathfinding");
+        stop_pathfinding_events.write(StopPathfindingEvent {
+            entity,
+            force: true,
+        });
     }
 }
 

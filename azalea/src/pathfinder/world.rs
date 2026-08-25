@@ -33,21 +33,23 @@ const MAX_VIEW_DISTANCE: usize = 32;
 /// must plan only over what the bot has actually observed can install their own
 /// source instead; see [`CachedWorld::with_block_source`].
 ///
-/// `None` means **unknown**, which is deliberately not the same as "air":
-/// the caller decides what unknown means by what it returns. Returning
-/// [`BlockState::AIR`] makes a cell passable but not standable, which is the
-/// usual choice — a bot may walk into terrain it has not seen, but must not
-/// assume there is a floor under it.
+/// `None` means **unknown**. It is replaced with
+/// [`BlockSource::missing_block_state`], which defaults to air for backwards
+/// compatibility. Strict sources can return an unwalkable, non-standable state
+/// there so unknown cells never enter the executable graph.
 pub trait BlockSource: Send + Sync {
     fn get_block_state(&self, pos: BlockPos) -> Option<BlockState>;
+
+    fn missing_block_state(&self) -> BlockState {
+        BlockState::AIR
+    }
 }
 
-/// Install a [`BlockSource`] on an entity and every pathfinder entry point will
-/// plan over it instead of the loaded world — initial search, replanning, and
-/// path patching alike.
+/// Install a [`BlockSource`] on an entity so initial search, non-mining
+/// replanning, and path patching use it instead of the loaded world.
 ///
-/// Routing only some of them would be worse than routing none: the bot would
-/// plan a legal path and then patch it with knowledge it does not have.
+/// The mining-cost path still reads loaded chunk sections directly. Callers
+/// that require a strict knowledge boundary must set `allow_mining(false)`.
 #[derive(bevy_ecs::component::Component, Clone)]
 pub struct PathfinderBlockSource(pub Arc<dyn BlockSource>);
 
@@ -180,8 +182,8 @@ impl CachedWorld {
 
     /// Plan over the given source instead of the client's loaded world.
     ///
-    /// Everything the source reports `None` for is treated as [`BlockState::AIR`]
-    /// by the bitsets below, i.e. passable but not standable.
+    /// Everything the source reports `None` for uses
+    /// [`BlockSource::missing_block_state`].
     pub fn with_block_source(mut self, source: Arc<dyn BlockSource>) -> Self {
         self.block_source = Some(source);
         self
@@ -364,7 +366,9 @@ impl CachedWorld {
 
     fn get_block_state_at_pos(&self, pos: BlockPos) -> BlockState {
         if let Some(source) = &self.block_source {
-            return source.get_block_state(pos).unwrap_or_default();
+            return source
+                .get_block_state(pos)
+                .unwrap_or_else(|| source.missing_block_state());
         }
         let (section_pos, section_block_pos) = (
             SmallChunkSectionPos::from(pos),
@@ -659,9 +663,7 @@ fn calculate_cached_mining_costs_index(pos: RelBlockPos) -> usize {
 /// Whether our client could pass through this block.
 /// Build a section's bitsets by asking a [`BlockSource`] about each cell.
 ///
-/// Cells the source does not know are treated as [`BlockState::AIR`]: passable,
-/// but **not standable**. That asymmetry is the point — a bot may walk into
-/// terrain it has not seen, but must never assume there is a floor under it.
+/// Cells the source does not know use [`BlockSource::missing_block_state`].
 ///
 /// The index encoding matches `u16::from(ChunkSectionBlockPos)`:
 /// `((y << 4) | z) << 4 | x`, with x/y/z each 0..16 inside the section.
@@ -686,8 +688,9 @@ fn bitsets_from_source(
             base_y + ((i >> 8) & 0xF) as i32,
             base_z + ((i >> 4) & 0xF) as i32,
         );
-        // Unknown reads as air, which is passable and not standable.
-        let block_state = source.get_block_state(pos).unwrap_or_default();
+        let block_state = source
+            .get_block_state(pos)
+            .unwrap_or_else(|| source.missing_block_state());
         if is_block_state_passable(block_state) {
             bitsets.passable.set(i);
         }
@@ -818,6 +821,51 @@ mod tests {
     use azalea_world::{Chunk, ChunkStorage, PartialWorld};
 
     use super::*;
+
+    struct DefaultUnknown;
+
+    impl BlockSource for DefaultUnknown {
+        fn get_block_state(&self, _pos: BlockPos) -> Option<BlockState> {
+            None
+        }
+    }
+
+    struct StrictUnknown;
+
+    impl BlockSource for StrictUnknown {
+        fn get_block_state(&self, _pos: BlockPos) -> Option<BlockState> {
+            None
+        }
+
+        fn missing_block_state(&self) -> BlockState {
+            BlockKind::Fire.into()
+        }
+    }
+
+    #[test]
+    fn a_block_source_controls_how_unknown_cells_enter_the_graph() {
+        let section = SmallChunkSectionPos::from(BlockPos::new(0, 0, 0));
+        let index = u16::from(ChunkSectionBlockPos::from(BlockPos::new(0, 0, 0))) as usize;
+
+        let optimistic = bitsets_from_source(&DefaultUnknown, section);
+        assert!(optimistic.passable.index(index));
+        assert!(!optimistic.standable.index(index));
+
+        let strict = bitsets_from_source(&StrictUnknown, section);
+        assert!(!strict.passable.index(index));
+        assert!(!strict.standable.index(index));
+
+        let direct = CachedWorld::new(
+            Arc::new(RwLock::new(ChunkStorage::default().into())),
+            BlockPos::default(),
+        )
+        .with_block_source(Arc::new(StrictUnknown));
+        assert_eq!(
+            direct.get_block_state_at_pos(BlockPos::default()),
+            BlockState::from(BlockKind::Fire),
+            "direct state reads and section bitsets must share the fallback"
+        );
+    }
 
     #[test]
     fn test_is_passable() {

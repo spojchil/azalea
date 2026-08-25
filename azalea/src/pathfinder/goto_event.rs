@@ -57,6 +57,7 @@ pub struct PathfinderOpts {
     pub(crate) successors_fn: SuccessorsFn,
     pub(crate) allow_mining: bool,
     pub(crate) retry_on_no_path: bool,
+    pub(crate) recalculate_partial_paths: bool,
     pub(crate) min_timeout: PathfinderTimeout,
     pub(crate) max_timeout: PathfinderTimeout,
 }
@@ -67,6 +68,7 @@ impl PathfinderOpts {
             successors_fn: moves::default_move,
             allow_mining: true,
             retry_on_no_path: true,
+            recalculate_partial_paths: true,
             min_timeout: PathfinderTimeout::Time(Duration::from_secs(1)),
             max_timeout: PathfinderTimeout::Time(Duration::from_secs(5)),
         }
@@ -91,6 +93,15 @@ impl PathfinderOpts {
     /// Defaults to `true`.
     pub fn retry_on_no_path(mut self, retry_on_no_path: bool) -> Self {
         self.retry_on_no_path = retry_on_no_path;
+        self
+    }
+    /// Set whether a partial path should automatically start another full-goal
+    /// calculation near or after the end of the returned segment.
+    ///
+    /// This does not disable local obstruction and timeout patching while the
+    /// segment is being executed. Defaults to `true`.
+    pub fn recalculate_partial_paths(mut self, recalculate_partial_paths: bool) -> Self {
+        self.recalculate_partial_paths = recalculate_partial_paths;
         self
     }
     /// The minimum amount of time that should pass before the A* pathfinder

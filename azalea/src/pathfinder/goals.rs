@@ -40,9 +40,9 @@ pub trait Goal: Debug + Send + Sync {
 pub struct BlockPosGoal(pub BlockPos);
 impl Goal for BlockPosGoal {
     fn heuristic(&self, n: BlockPos) -> f32 {
-        let dx = (self.0.x - n.x) as f32;
-        let dy = (self.0.y - n.y) as f32;
-        let dz = (self.0.z - n.z) as f32;
+        let dx = coordinate_delta(self.0.x, n.x);
+        let dy = coordinate_delta(self.0.y, n.y);
+        let dz = coordinate_delta(self.0.z, n.z);
 
         xz_heuristic(dx, dz) + y_heuristic(dy)
     }
@@ -51,20 +51,16 @@ impl Goal for BlockPosGoal {
     }
 }
 
+#[inline]
+fn coordinate_delta(goal: i32, node: i32) -> f32 {
+    (i64::from(goal) - i64::from(node)) as f32
+}
+
 fn xz_heuristic(dx: f32, dz: f32) -> f32 {
     let x = dx.abs();
     let z = dz.abs();
 
-    let diagonal;
-    let straight;
-
-    if x < z {
-        straight = z - x;
-        diagonal = x;
-    } else {
-        straight = x - z;
-        diagonal = z;
-    }
+    let (straight, diagonal) = if x < z { (z - x, x) } else { (x - z, z) };
 
     (diagonal * SQRT_2 + straight) * COST_HEURISTIC
 }
@@ -78,8 +74,8 @@ pub struct XZGoal {
 }
 impl Goal for XZGoal {
     fn heuristic(&self, n: BlockPos) -> f32 {
-        let dx = (self.x - n.x) as f32;
-        let dz = (self.z - n.z) as f32;
+        let dx = coordinate_delta(self.x, n.x);
+        let dz = coordinate_delta(self.z, n.z);
         xz_heuristic(dx, dz)
     }
     fn success(&self, n: BlockPos) -> bool {
@@ -124,11 +120,35 @@ pub struct YGoal {
 }
 impl Goal for YGoal {
     fn heuristic(&self, n: BlockPos) -> f32 {
-        let dy = (self.y - n.y) as f32;
+        let dy = coordinate_delta(self.y, n.y);
         y_heuristic(dy)
     }
     fn success(&self, n: BlockPos) -> bool {
         n.y == self.y
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_goals_have_finite_heuristics_at_coordinate_extremes() {
+        let low = BlockPos::new(i32::MIN, i32::MIN, i32::MIN);
+        let high = BlockPos::new(i32::MAX, i32::MAX, i32::MAX);
+
+        for heuristic in [
+            BlockPosGoal(low).heuristic(high),
+            XZGoal {
+                x: i32::MIN,
+                z: i32::MAX,
+            }
+            .heuristic(high),
+            YGoal { y: i32::MIN }.heuristic(high),
+        ] {
+            assert!(heuristic.is_finite());
+            assert!(heuristic >= 0.0);
+        }
     }
 }
 impl From<BlockPos> for YGoal {

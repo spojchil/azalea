@@ -1,7 +1,7 @@
 pub mod patching;
 pub mod simulation;
 
-use std::{cmp, time::Duration};
+use std::{cmp, collections::VecDeque, time::Duration};
 
 use azalea_block::{BlockState, BlockTrait};
 use azalea_client::{
@@ -26,13 +26,13 @@ use crate::{
         system::{Commands, Query, Res},
     },
     pathfinder::{
-        ExecutingPath, GotoEvent, Pathfinder, PathfinderSystems,
+        ComputePath, ExecutingPath, GotoEvent, Pathfinder, PathfinderSystems,
         astar::PathfinderTimeout,
         custom_state::CustomPathfinderState,
         debug::debug_render_path_with_particles,
         execute::simulation::SimulatingPathState,
         moves::{ExecuteCtx, IsReachedCtx},
-        player_pos_to_block_pos,
+        next_path_calculation_id, player_pos_to_block_pos,
     },
 };
 
@@ -64,6 +64,13 @@ impl Plugin for DefaultPathfinderExecutionPlugin {
                 .in_set(PathfinderSystems),
         );
     }
+}
+
+pub(super) fn retire_pathfinder_request(pathfinder: &mut Pathfinder) {
+    next_path_calculation_id(&pathfinder.goto_id);
+    pathfinder.goal = None;
+    pathfinder.opts = None;
+    pathfinder.is_calculating = false;
 }
 
 #[allow(clippy::type_complexity)]
@@ -218,6 +225,9 @@ pub fn check_node_reached(
                                 direction: WalkDirection::None,
                             });
                             commands.entity(entity).remove::<ExecutingPath>();
+                            if pathfinder.goal.is_none() {
+                                pathfinder.opts = None;
+                            }
                             break;
                         }
 
@@ -236,7 +246,25 @@ pub fn check_node_reached(
                             && goal.success(movement.target)
                         {
                             info!("goal was reached!");
-                            pathfinder.goal = None;
+                            // The segment that reached this goal may have been
+                            // retained while a replacement calculation ran.
+                            // Invalidate that worker before it can revive
+                            // movement after arrival.
+                            retire_pathfinder_request(&mut pathfinder);
+                            commands.entity(entity).remove::<ComputePath>();
+                        } else if executing_path.is_path_partial
+                            && !pathfinder.is_calculating
+                            && pathfinder
+                                .opts
+                                .as_ref()
+                                .is_some_and(|opts| !opts.recalculate_partial_paths)
+                        {
+                            debug!("partial path ended with automatic recalculation disabled");
+                            retire_pathfinder_request(&mut pathfinder);
+                            commands.entity(entity).remove::<ComputePath>();
+                        } else if pathfinder.goal.is_none() {
+                            // A graceful stop keeps opts while the last movement
+                            // is in flight so local patching remains available.
                             pathfinder.opts = None;
                         }
                     }
@@ -380,6 +408,7 @@ fn patch_path_from_timeout(
     block_source: Option<&crate::pathfinder::world::PathfinderBlockSource>,
     inventory: &Inventory,
 ) {
+    let graceful_stop_pending = graceful_stop_pending(pathfinder, executing_path);
     executing_path.queued_path = None;
     let cur_pos = player_pos_to_block_pos(**position);
     executing_path.last_reached_node = cur_pos;
@@ -388,6 +417,7 @@ fn patch_path_from_timeout(
         .get(world_name)
         .expect("Entity tried to pathfind but the entity isn't in a valid world");
     let Some(opts) = pathfinder.opts.clone() else {
+        restore_graceful_stop(executing_path, graceful_stop_pending);
         warn!(
             "pathfinder was going to patch path because of timeout, but pathfinder.opts was None"
         );
@@ -410,8 +440,32 @@ fn patch_path_from_timeout(
         block_source.map(|source| source.0.clone()),
         opts,
     );
+    restore_graceful_stop(executing_path, graceful_stop_pending);
     // reset last_node_reached_at so we don't immediately try to patch again
     executing_path.ticks_since_last_node_reached = 0
+}
+
+pub(super) fn graceful_stop_pending(
+    pathfinder: &Pathfinder,
+    executing_path: &ExecutingPath,
+) -> bool {
+    pathfinder.goal.is_none()
+        && executing_path
+            .queued_path
+            .as_ref()
+            .is_some_and(VecDeque::is_empty)
+}
+
+pub(super) fn restore_graceful_stop(
+    executing_path: &mut ExecutingPath,
+    graceful_stop_pending: bool,
+) {
+    if graceful_stop_pending {
+        // Timeout recovery may replace the current movement, but it must not
+        // erase a graceful stop's "finish one movement, then stop" sentinel.
+        executing_path.queued_path = Some(VecDeque::new());
+        executing_path.is_path_partial = false;
+    }
 }
 
 pub fn recalculate_near_end_of_path(
@@ -421,9 +475,48 @@ pub fn recalculate_near_end_of_path(
     mut commands: Commands,
 ) {
     for (entity, mut pathfinder, mut executing_path) in &mut query {
+        // No active goal can own an empty execution component. This includes
+        // graceful-stop timeout recovery when patching produced no movement.
+        // Handle it independently of retry/partial options so it cannot become
+        // a motionless zombie with latched walk input.
+        if pathfinder.goal.is_none() && executing_path.path.is_empty() {
+            retire_pathfinder_request(&mut pathfinder);
+            commands.entity(entity).remove::<ComputePath>();
+            commands.entity(entity).remove::<ExecutingPath>();
+            walk_events.write(StartWalkEvent {
+                entity,
+                direction: WalkDirection::None,
+            });
+            continue;
+        }
+
         let Some(mut opts) = pathfinder.opts.clone() else {
             continue;
         };
+
+        // A caller may deliberately own full-goal replanning while still
+        // letting Azalea execute and locally patch the returned segment. If a
+        // patch truncated that segment to zero, retire the empty execution
+        // component instead of leaving a motionless zombie.
+        if executing_path.path.is_empty() && !opts.recalculate_partial_paths {
+            if let Some(new_path) = executing_path.queued_path.take() {
+                executing_path.path = new_path;
+            }
+            if executing_path.path.is_empty() {
+                // An empty old segment may coexist with a replacement goto.
+                // Retire the segment, but leave that active request intact.
+                if !pathfinder.is_calculating {
+                    retire_pathfinder_request(&mut pathfinder);
+                    commands.entity(entity).remove::<ComputePath>();
+                }
+                walk_events.write(StartWalkEvent {
+                    entity,
+                    direction: WalkDirection::None,
+                });
+                commands.entity(entity).remove::<ExecutingPath>();
+            }
+            continue;
+        }
 
         // start recalculating if the path ends soon. 50 is arbitrary, that's just to
         // make us recalculate once when we start nearing the end. this doesn't account
@@ -433,6 +526,7 @@ pub fn recalculate_near_end_of_path(
         if (executing_path.path.len() == 50 || executing_path.path.len() < 5)
             && !pathfinder.is_calculating
             && executing_path.is_path_partial
+            && opts.recalculate_partial_paths
         {
             match pathfinder.goal.as_ref().cloned() {
                 Some(goal) => {
@@ -465,7 +559,7 @@ pub fn recalculate_near_end_of_path(
                                     direction: WalkDirection::None,
                                 });
                                 commands.entity(entity).remove::<ExecutingPath>();
-                                break;
+                                continue;
                             }
                         } else {
                             walk_events.write(StartWalkEvent {
@@ -479,10 +573,12 @@ pub fn recalculate_near_end_of_path(
                 _ => {
                     if executing_path.path.is_empty() {
                         // idk when this can happen but stop moving just in case
+                        pathfinder.opts = None;
                         walk_events.write(StartWalkEvent {
                             entity,
                             direction: WalkDirection::None,
                         });
+                        commands.entity(entity).remove::<ExecutingPath>();
                     }
                 }
             }
@@ -500,6 +596,12 @@ pub fn recalculate_if_has_goal_but_no_path(
             && let Some(goal) = pathfinder.goal.as_ref().cloned()
             && let Some(opts) = pathfinder.opts.clone()
         {
+            if !opts.retry_on_no_path {
+                debug!("retry_on_no_path is disabled, retiring the exhausted goal");
+                pathfinder.goal = None;
+                pathfinder.opts = None;
+                continue;
+            }
             debug!("Recalculating path because it has a goal but no ExecutingPath");
             goto_events.write(GotoEvent { entity, goal, opts });
             pathfinder.is_calculating = true;

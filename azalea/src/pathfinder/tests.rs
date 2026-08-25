@@ -41,6 +41,7 @@ fn setup_blockposgoal_simulation(
             successors_fn: moves::default_move,
             allow_mining: false,
             retry_on_no_path: true,
+            recalculate_partial_paths: true,
             min_timeout: PathfinderTimeout::Nodes(1_000_000),
             max_timeout: PathfinderTimeout::Nodes(5_000_000),
         },
