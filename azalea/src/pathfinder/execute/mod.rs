@@ -32,7 +32,7 @@ use crate::{
         debug::debug_render_path_with_particles,
         execute::simulation::SimulatingPathState,
         moves::{ExecuteCtx, IsReachedCtx},
-        next_path_calculation_id, player_pos_to_block_pos,
+        next_path_calculation_id, player_pos_to_block_pos, reserve_queued_goto,
     },
 };
 
@@ -68,6 +68,7 @@ impl Plugin for DefaultPathfinderExecutionPlugin {
 
 pub(super) fn retire_pathfinder_request(pathfinder: &mut Pathfinder) {
     next_path_calculation_id(&pathfinder.goto_id);
+    pathfinder.queued_goto_id = None;
     pathfinder.goal = None;
     pathfinder.opts = None;
     pathfinder.is_calculating = false;
@@ -242,7 +243,8 @@ pub fn check_node_reached(
                             direction: WalkDirection::None,
                         });
                         commands.entity(entity).remove::<ExecutingPath>();
-                        if let Some(goal) = pathfinder.goal.clone()
+                        if pathfinder.queued_goto_id.is_none()
+                            && let Some(goal) = pathfinder.goal.clone()
                             && goal.success(movement.target)
                         {
                             info!("goal was reached!");
@@ -254,6 +256,7 @@ pub fn check_node_reached(
                             commands.entity(entity).remove::<ComputePath>();
                         } else if executing_path.is_path_partial
                             && !pathfinder.is_calculating
+                            && pathfinder.queued_goto_id.is_none()
                             && pathfinder
                                 .opts
                                 .as_ref()
@@ -306,6 +309,13 @@ pub fn timeout_movement(
         simulating_path_state,
     ) in &mut query
     {
+        // A queued replacement or an active full-goal calculation owns the
+        // current generation. Local timeout patching allocates a generation
+        // of its own, so running it here would incorrectly stale that work.
+        if pathfinder.queued_goto_id.is_some() || pathfinder.is_calculating {
+            continue;
+        }
+
         if !executing_path.path.is_empty() {
             let (start, end) = if let Some(s) = &simulating_path_state
                 && let SimulatingPathState::Simulated(simulating_path_state) = &**s
@@ -376,7 +386,6 @@ pub fn timeout_movement(
         }
 
         if executing_path.ticks_since_last_node_reached > timeout
-            && !pathfinder.is_calculating
             && !executing_path.path.is_empty()
         {
             warn!("pathfinder timeout, trying to patch path");
@@ -417,9 +426,16 @@ fn patch_path_from_timeout(
         .get(world_name)
         .expect("Entity tried to pathfind but the entity isn't in a valid world");
     let Some(opts) = pathfinder.opts.clone() else {
-        restore_graceful_stop(executing_path, graceful_stop_pending);
         warn!(
-            "pathfinder was going to patch path because of timeout, but pathfinder.opts was None"
+            "pathfinder was going to patch path because of timeout, but pathfinder.opts was None; ending the current segment"
+        );
+        executing_path.path.clear();
+        executing_path.is_path_partial = true;
+        retire_pathfinder_request(pathfinder);
+        finish_timeout_patch(
+            executing_path,
+            graceful_stop_pending,
+            patching::PatchOutcome::NoPath,
         );
         return;
     };
@@ -429,7 +445,7 @@ fn patch_path_from_timeout(
     // try to fix the path without recalculating everything.
     // (though, it'll still get fully recalculated by `recalculate_near_end_of_path`
     // if the new path is too short)
-    patching::patch_path(
+    let outcome = patching::patch_path(
         0..=cmp::min(20, executing_path.path.len() - 1),
         executing_path,
         pathfinder,
@@ -440,9 +456,20 @@ fn patch_path_from_timeout(
         block_source.map(|source| source.0.clone()),
         opts,
     );
+    finish_timeout_patch(executing_path, graceful_stop_pending, outcome);
+}
+
+pub(super) fn finish_timeout_patch(
+    executing_path: &mut ExecutingPath,
+    graceful_stop_pending: bool,
+    outcome: patching::PatchOutcome,
+) {
     restore_graceful_stop(executing_path, graceful_stop_pending);
-    // reset last_node_reached_at so we don't immediately try to patch again
-    executing_path.ticks_since_last_node_reached = 0
+    if outcome == patching::PatchOutcome::Applied {
+        // A usable replacement is real recovery. Give that replacement its
+        // own movement deadline instead of immediately patching it again.
+        executing_path.ticks_since_last_node_reached = 0;
+    }
 }
 
 pub(super) fn graceful_stop_pending(
@@ -480,7 +507,9 @@ pub fn recalculate_near_end_of_path(
         // Handle it independently of retry/partial options so it cannot become
         // a motionless zombie with latched walk input.
         if pathfinder.goal.is_none() && executing_path.path.is_empty() {
-            retire_pathfinder_request(&mut pathfinder);
+            if pathfinder.queued_goto_id.is_none() {
+                retire_pathfinder_request(&mut pathfinder);
+            }
             commands.entity(entity).remove::<ComputePath>();
             commands.entity(entity).remove::<ExecutingPath>();
             walk_events.write(StartWalkEvent {
@@ -505,7 +534,7 @@ pub fn recalculate_near_end_of_path(
             if executing_path.path.is_empty() {
                 // An empty old segment may coexist with a replacement goto.
                 // Retire the segment, but leave that active request intact.
-                if !pathfinder.is_calculating {
+                if !pathfinder.is_calculating && pathfinder.queued_goto_id.is_none() {
                     retire_pathfinder_request(&mut pathfinder);
                     commands.entity(entity).remove::<ComputePath>();
                 }
@@ -525,6 +554,7 @@ pub fn recalculate_near_end_of_path(
         // that `&& path.len() <= 50` to see if we should recalculate.
         if (executing_path.path.len() == 50 || executing_path.path.len() < 5)
             && !pathfinder.is_calculating
+            && pathfinder.queued_goto_id.is_none()
             && executing_path.is_path_partial
             && opts.recalculate_partial_paths
         {
@@ -544,7 +574,13 @@ pub fn recalculate_near_end_of_path(
                         PathfinderTimeout::Time(Duration::from_secs(1))
                     };
 
-                    goto_events.write(GotoEvent { entity, goal, opts });
+                    let calculation_id = reserve_queued_goto(&mut pathfinder);
+                    goto_events.write(GotoEvent {
+                        entity,
+                        goal,
+                        opts,
+                        calculation_id: Some(calculation_id),
+                    });
                     pathfinder.is_calculating = true;
 
                     if executing_path.path.is_empty() {
@@ -593,6 +629,7 @@ pub fn recalculate_if_has_goal_but_no_path(
     for (entity, mut pathfinder) in &mut query {
         if pathfinder.goal.is_some()
             && !pathfinder.is_calculating
+            && pathfinder.queued_goto_id.is_none()
             && let Some(goal) = pathfinder.goal.as_ref().cloned()
             && let Some(opts) = pathfinder.opts.clone()
         {
@@ -603,7 +640,13 @@ pub fn recalculate_if_has_goal_but_no_path(
                 continue;
             }
             debug!("Recalculating path because it has a goal but no ExecutingPath");
-            goto_events.write(GotoEvent { entity, goal, opts });
+            let calculation_id = reserve_queued_goto(&mut pathfinder);
+            goto_events.write(GotoEvent {
+                entity,
+                goal,
+                opts,
+                calculation_id: Some(calculation_id),
+            });
             pathfinder.is_calculating = true;
         }
     }

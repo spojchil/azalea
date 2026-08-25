@@ -28,6 +28,16 @@ use crate::pathfinder::{
     world::CachedWorld,
 };
 
+/// Whether a local patch left at least one safe movement to execute.
+///
+/// A failed patch is not progress. Callers that use a stall deadline must not
+/// reset it for [`PatchOutcome::NoPath`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchOutcome {
+    Applied,
+    NoPath,
+}
+
 #[allow(clippy::type_complexity)]
 pub fn check_for_path_obstruction(
     mut query: Query<(
@@ -42,6 +52,13 @@ pub fn check_for_path_obstruction(
     worlds: Res<Worlds>,
 ) {
     query.par_iter_mut().for_each(|(entity, mut pathfinder, mut executing_path, world_name, inventory, custom_state, block_source)| {
+        // A queued replacement or an active full-goal calculation owns the
+        // current generation. Local patching allocates another generation and
+        // would otherwise invalidate that work.
+        if pathfinder.queued_goto_id.is_some() || pathfinder.is_calculating {
+            return;
+        }
+
         let Some(opts) = pathfinder.opts.clone() else {
             return;
         };
@@ -149,7 +166,7 @@ pub fn patch_path(
     custom_state: CustomPathfinderState,
     block_source: Option<Arc<dyn crate::pathfinder::world::BlockSource>>,
     opts: PathfinderOpts,
-) {
+) -> PatchOutcome {
     let patch_start = if *patch_nodes.start() == 0 {
         executing_path.last_reached_node
     } else {
@@ -228,6 +245,12 @@ pub fn patch_path(
     executing_path.path = new_path;
     if !is_patch_complete {
         executing_path.is_path_partial = true;
+    }
+
+    if executing_path.path.is_empty() {
+        PatchOutcome::NoPath
+    } else {
+        PatchOutcome::Applied
     }
 }
 

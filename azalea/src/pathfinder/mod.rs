@@ -119,6 +119,14 @@ pub struct Pathfinder {
     pub goal: Option<Arc<dyn Goal>>,
     pub opts: Option<PathfinderOpts>,
     pub is_calculating: bool,
+    /// The generation of a stamped [`GotoEvent`] that has been queued but has
+    /// not yet been consumed by [`goto_listener`].
+    ///
+    /// Unlike `goal` and `is_calculating`, this is set synchronously by
+    /// [`PathfinderClientExt::start_goto_with_opts`]. Consumers can therefore
+    /// distinguish a request that is still waiting in Bevy's message buffer
+    /// from one that was consumed and immediately completed without a path.
+    pub queued_goto_id: Option<usize>,
     pub goto_id: Arc<AtomicUsize>,
 }
 
@@ -222,13 +230,17 @@ pub trait PathfinderClientExt {
     /// it's undesirable then you may want to consider using
     /// [`Self::force_stop_pathfinding`] instead.
     fn stop_pathfinding(&self);
-    /// Stop calculating a path and stop executing the current movement
-    /// immediately.
+    /// Queue a request to stop calculating a path and stop executing the
+    /// current movement without waiting for that movement to finish.
+    ///
+    /// This buffered API takes effect when the pathfinder stop listener runs.
+    /// Use [`Client::force_retire_pathfinding`] when retirement must happen
+    /// synchronously before this call returns.
     fn force_stop_pathfinding(&self);
     /// Waits forever until the bot no longer has a pathfinder goal.
     fn wait_until_goto_target_reached(&self) -> impl Future<Output = ()>;
-    /// Returns true if the pathfinder has no active goal and isn't calculating
-    /// a path.
+    /// Returns true if the pathfinder has no queued request or active goal and
+    /// isn't calculating a path.
     fn is_goto_target_reached(&self) -> bool;
     /// Whether the pathfinder is currently following a path.
     ///
@@ -254,9 +266,15 @@ impl PathfinderClientExt for Client {
         self.start_goto_with_opts(goal, PathfinderOpts::new());
     }
     fn start_goto_with_opts(&self, goal: impl Goal + 'static, opts: PathfinderOpts) {
-        self.ecs
-            .write()
-            .write_message(GotoEvent::new(self.entity, goal, opts));
+        let mut ecs = self.ecs.write();
+        let mut event = GotoEvent::new(self.entity, goal, opts);
+        if let Some(mut pathfinder) = ecs.get_mut::<Pathfinder>(self.entity) {
+            // Reserve while the same ECS write lock that queues the request is
+            // held. A later client request or synchronous retirement can now
+            // make this still-buffered message stale before the listener runs.
+            event.calculation_id = Some(reserve_queued_goto(&mut pathfinder));
+        }
+        ecs.write_message(event);
     }
     fn stop_pathfinding(&self) {
         self.ecs.write().write_message(StopPathfindingEvent {
@@ -270,7 +288,6 @@ impl PathfinderClientExt for Client {
             force: true,
         });
     }
-
     async fn wait_until_goto_target_reached(&self) {
         // we do this to make sure the event got handled before we start checking
         // is_goto_target_reached
@@ -288,7 +305,7 @@ impl PathfinderClientExt for Client {
     }
     fn is_goto_target_reached(&self) -> bool {
         self.get_component::<Pathfinder>()
-            .is_none_or(|p| p.goal.is_none() && !p.is_calculating)
+            .is_none_or(|p| p.queued_goto_id.is_none() && p.goal.is_none() && !p.is_calculating)
     }
     fn is_executing_path(&self) -> bool {
         self.get_component::<ExecutingPath>().is_some()
@@ -296,6 +313,22 @@ impl PathfinderClientExt for Client {
     fn is_calculating_path(&self) -> bool {
         self.get_component::<Pathfinder>()
             .is_some_and(|p| p.is_calculating)
+    }
+}
+
+impl Client {
+    /// Synchronously retire every request queued through this client's
+    /// pathfinder methods, as well as any calculating or executing request,
+    /// then queue a walking-input stop.
+    ///
+    /// Unlike [`PathfinderClientExt::force_stop_pathfinding`], all pathfinder
+    /// generation, state, and component cleanup takes effect while the
+    /// client's ECS write lock is held. This is useful when a replacement or
+    /// terminal outcome must be linearized before another queued goto can run.
+    /// Raw unstamped [`GotoEvent::new`] messages are outside this synchronous
+    /// ordering guarantee.
+    pub fn force_retire_pathfinding(&self) {
+        force_retire_pathfinding_in_world(&mut self.ecs.write(), self.entity);
     }
 }
 
@@ -312,9 +345,9 @@ pub fn goto_listener(
         &mut Pathfinder,
         Option<&mut ExecutingPath>,
         Option<&SimulatingPathState>,
-        &Position,
-        &WorldName,
-        &Inventory,
+        Option<&Position>,
+        Option<&WorldName>,
+        Option<&Inventory>,
         Option<&CustomPathfinderState>,
         Option<&world::PathfinderBlockSource>,
     )>,
@@ -350,12 +383,56 @@ pub fn goto_listener(
             }
         }
 
-        let cur_pos = player_pos_to_block_pos(**position);
         let goto_id_atomic = pathfinder.goto_id.clone();
-        // Allocate the generation on the ECS thread before spawning A*. If the
-        // task allocated it after being scheduled, an older slow-to-start task
-        // could incorrectly supersede a newer request.
-        let calculation_id = next_path_calculation_id(&goto_id_atomic);
+        let calculation_id = if let Some(calculation_id) = event.calculation_id {
+            let current_id = goto_id_atomic.load(atomic::Ordering::SeqCst);
+            if calculation_id != current_id {
+                debug!(
+                    "discarding queued goto from obsolete calculation {calculation_id}; current calculation is {current_id}"
+                );
+                continue;
+            }
+            calculation_id
+        } else {
+            if let Some(queued_id) = pathfinder.queued_goto_id {
+                // Messages are consumed in FIFO order. An unstamped message
+                // observed while a stamped request is still queued must have
+                // been written before that stamped request, so it cannot be
+                // allowed to allocate a newer generation and supersede it.
+                debug!("discarding unstamped goto queued before stamped calculation {queued_id}");
+                continue;
+            }
+            // Raw GotoEvent::new messages have no generation until they reach
+            // this listener. Preserve that public compatibility path while
+            // client APIs reserve their generation before queueing.
+            next_path_calculation_id(&goto_id_atomic)
+        };
+
+        // Clear only the request this listener is about to consume. A stale
+        // message must never erase the marker belonging to its replacement.
+        if pathfinder.queued_goto_id == Some(calculation_id) {
+            pathfinder.queued_goto_id = None;
+        }
+
+        let (Some(position), Some(world_name), Some(inventory)) = (position, world_name, inventory)
+        else {
+            // The message has been consumed and cannot be retried. Leave a
+            // terminal state rather than a permanent "queued" marker or an
+            // obsolete calculation that can no longer produce a usable path.
+            warn!("got goto event for an entity missing position, world name, or inventory");
+            pathfinder.goal = None;
+            pathfinder.opts = None;
+            pathfinder.is_calculating = false;
+            commands.entity(event.entity).remove::<ComputePath>();
+            commands.entity(event.entity).remove::<ExecutingPath>();
+            walk_events.write(StartWalkEvent {
+                entity: event.entity,
+                direction: WalkDirection::None,
+            });
+            continue;
+        };
+
+        let cur_pos = player_pos_to_block_pos(**position);
 
         if event.goal.success(cur_pos) {
             // we're already at the goal, nothing to do
@@ -527,6 +604,13 @@ fn next_path_calculation_id(goto_id_atomic: &AtomicUsize) -> usize {
     goto_id_atomic
         .fetch_add(1, atomic::Ordering::SeqCst)
         .wrapping_add(1)
+}
+
+/// Reserve and expose the generation of a goto before its message is queued.
+fn reserve_queued_goto(pathfinder: &mut Pathfinder) -> usize {
+    let calculation_id = next_path_calculation_id(&pathfinder.goto_id);
+    pathfinder.queued_goto_id = Some(calculation_id);
+    calculation_id
 }
 
 pub struct CalculatePathCtx {
@@ -843,6 +927,28 @@ pub fn path_found_listener(
     }
 }
 
+/// Apply the force-retirement invariant directly to an ECS world.
+///
+/// Both the synchronous client API and the buffered stop handler use this
+/// helper so they cannot drift on generation, component, or movement cleanup.
+fn force_retire_pathfinding_in_world(world: &mut bevy_ecs::world::World, entity: Entity) {
+    {
+        let Ok(mut entity_mut) = world.get_entity_mut(entity) else {
+            return;
+        };
+        if let Some(mut pathfinder) = entity_mut.get_mut::<Pathfinder>() {
+            execute::retire_pathfinder_request(&mut pathfinder);
+        }
+        entity_mut.remove::<ComputePath>();
+        entity_mut.remove::<ExecutingPath>();
+    }
+
+    world.write_message(StartWalkEvent {
+        entity,
+        direction: WalkDirection::None,
+    });
+}
+
 #[derive(Message)]
 pub struct StopPathfindingEvent {
     pub entity: Entity,
@@ -861,6 +967,14 @@ pub fn handle_stop_pathfinding_event(
     mut commands: Commands,
 ) {
     for event in events.read() {
+        if event.force {
+            let entity = event.entity;
+            commands.queue(move |world: &mut bevy_ecs::world::World| {
+                force_retire_pathfinding_in_world(world, entity);
+            });
+            continue;
+        }
+
         // stop computing any path that's being computed
         commands.entity(event.entity).remove::<ComputePath>();
 
@@ -870,11 +984,12 @@ pub fn handle_stop_pathfinding_event(
         // Invalidate workers as well as the task component. A worker may have
         // completed between its final check and PathFoundEvent consumption.
         next_path_calculation_id(&pathfinder.goto_id);
+        pathfinder.queued_goto_id = None;
         pathfinder.goal = None;
         pathfinder.is_calculating = false;
 
         match executing_path {
-            Some(mut executing_path) if !event.force && !executing_path.path.is_empty() => {
+            Some(mut executing_path) if !executing_path.path.is_empty() => {
                 // Finish the current movement before switching to an empty
                 // path. Keep opts until then because local patching still uses
                 // them.
@@ -925,6 +1040,7 @@ pub fn stop_pathfinding_on_world_change(
         }
         let has_active_navigation = executing_path.is_some()
             || compute_path.is_some()
+            || pathfinder.queued_goto_id.is_some()
             || pathfinder.goal.is_some()
             || pathfinder.is_calculating;
         if !has_active_navigation {

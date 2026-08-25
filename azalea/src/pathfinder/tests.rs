@@ -45,6 +45,7 @@ fn setup_blockposgoal_simulation(
             min_timeout: PathfinderTimeout::Nodes(1_000_000),
             max_timeout: PathfinderTimeout::Nodes(5_000_000),
         },
+        calculation_id: None,
     });
     simulation
 }
@@ -295,6 +296,7 @@ fn test_mine_through_non_colliding_block() {
         opts: PathfinderOpts::new()
             .min_timeout(PathfinderTimeout::Nodes(1_000_000))
             .max_timeout(PathfinderTimeout::Nodes(5_000_000)),
+        calculation_id: None,
     });
 
     assert_simulation_reaches(&mut simulation, 200, BlockPos::new(0, 70, 0));

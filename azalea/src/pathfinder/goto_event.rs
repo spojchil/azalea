@@ -23,14 +23,25 @@ pub struct GotoEvent {
     pub entity: Entity,
     pub goal: Arc<dyn Goal>,
     pub opts: PathfinderOpts,
+    /// Generation reserved by high-level entry points before this message is
+    /// queued. Direct [`GotoEvent::new`] callers leave this unstamped so the
+    /// listener can allocate a generation for backwards compatibility.
+    pub(crate) calculation_id: Option<usize>,
 }
 
 impl GotoEvent {
+    /// Build an unstamped goto message.
+    ///
+    /// Its generation is allocated when
+    /// [`goto_listener`](crate::pathfinder::goto_listener) consumes it.
+    /// Prefer the [`Client`](crate::Client) pathfinder methods when request
+    /// ordering must already be fixed while messages are still queued.
     pub fn new(entity: Entity, goal: impl Goal + 'static, opts: PathfinderOpts) -> Self {
         Self {
             entity,
             goal: Arc::new(goal),
             opts,
+            calculation_id: None,
         }
     }
 }
