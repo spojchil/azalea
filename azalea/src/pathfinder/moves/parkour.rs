@@ -61,10 +61,7 @@ fn parkour_forward_1_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
         ctx.edges.push(Edge {
             movement: astar::Movement {
                 target: pos + offset.up(ascend),
-                data: MoveData {
-                    execute: &execute_parkour_move,
-                    is_reached: &parkour_is_reached,
-                },
+                data: MoveData::new(&execute_parkour_move, &parkour_is_reached),
             },
             cost,
         })
@@ -119,10 +116,7 @@ fn parkour_forward_2_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
         ctx.edges.push(Edge {
             movement: astar::Movement {
                 target: pos + offset.up(ascend),
-                data: MoveData {
-                    execute: &execute_parkour_move,
-                    is_reached: &parkour_is_reached,
-                },
+                data: MoveData::new(&execute_parkour_move, &parkour_is_reached),
             },
             cost,
         })
@@ -171,10 +165,7 @@ fn parkour_forward_3_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
         ctx.edges.push(Edge {
             movement: astar::Movement {
                 target: pos + offset,
-                data: MoveData {
-                    execute: &execute_parkour_move,
-                    is_reached: &parkour_is_reached,
-                },
+                data: MoveData::new(&execute_parkour_move, &parkour_is_reached),
             },
             cost,
         })

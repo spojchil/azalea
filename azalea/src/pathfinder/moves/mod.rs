@@ -49,6 +49,101 @@ pub fn default_move(ctx: &mut MovesCtx, node: RelBlockPos) {
     uncommon::uncommon_move(ctx, node);
 }
 
+const MAX_BLOCKS_TO_BREAK_PER_MOVEMENT: usize = 5;
+
+/// A block position relative to the source node of a movement.
+///
+/// Keeping side effects relative makes the declaration valid both while A*
+/// searches in [`RelBlockPos`] space and after the path is mapped back to
+/// absolute [`BlockPos`] coordinates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockOffset {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+impl BlockOffset {
+    pub(crate) fn between(source: RelBlockPos, target: RelBlockPos) -> Self {
+        Self {
+            x: i32::from(target.x) - i32::from(source.x),
+            y: target.y - source.y,
+            z: i32::from(target.z) - i32::from(source.z),
+        }
+    }
+
+    fn apply(self, source: BlockPos) -> BlockPos {
+        BlockPos::new(source.x + self.x, source.y + self.y, source.z + self.z)
+    }
+}
+
+/// The exact world-changing positions a movement is allowed to touch.
+///
+/// This mirrors Baritone's `positionsToBreak` / `positionToPlace` contract:
+/// movement execution may react to the world changing, but it may never mine
+/// or place outside the positions declared by the planned edge.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MovementSideEffects {
+    blocks_to_break: [Option<BlockOffset>; MAX_BLOCKS_TO_BREAK_PER_MOVEMENT],
+    block_to_place: Option<BlockOffset>,
+}
+
+impl MovementSideEffects {
+    pub(crate) fn breaking<const N: usize>(source: RelBlockPos, blocks: [RelBlockPos; N]) -> Self {
+        Self::default().with_breaks(blocks.map(|block| BlockOffset::between(source, block)))
+    }
+
+    pub(crate) fn breaking_iter(
+        source: RelBlockPos,
+        blocks: impl IntoIterator<Item = RelBlockPos>,
+    ) -> Self {
+        let mut side_effects = Self::default();
+        for (index, block) in blocks.into_iter().enumerate() {
+            assert!(
+                index < MAX_BLOCKS_TO_BREAK_PER_MOVEMENT,
+                "a movement declared too many blocks to break"
+            );
+            side_effects.blocks_to_break[index] = Some(BlockOffset::between(source, block));
+        }
+        side_effects
+    }
+
+    pub(crate) fn with_breaks<const N: usize>(mut self, blocks: [BlockOffset; N]) -> Self {
+        assert!(
+            N <= MAX_BLOCKS_TO_BREAK_PER_MOVEMENT,
+            "a movement declared too many blocks to break"
+        );
+        for (slot, block) in self.blocks_to_break.iter_mut().zip(blocks) {
+            *slot = Some(block);
+        }
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_place(mut self, block: BlockOffset) -> Self {
+        self.block_to_place = Some(block);
+        self
+    }
+
+    /// Resolve the declared break positions for a concrete movement source.
+    pub fn blocks_to_break(&self, source: BlockPos) -> impl Iterator<Item = BlockPos> + use<'_> {
+        self.blocks_to_break
+            .iter()
+            .flatten()
+            .map(move |offset| offset.apply(source))
+    }
+
+    /// Resolve the declared placement position for a concrete movement source.
+    pub fn block_to_place(&self, source: BlockPos) -> Option<BlockPos> {
+        self.block_to_place.map(|offset| offset.apply(source))
+    }
+
+    fn allows_break(&self, source: BlockPos, block: BlockPos) -> bool {
+        self.blocks_to_break(source)
+            .any(|declared| declared == block)
+    }
+}
+
 #[derive(Clone)]
 pub struct MoveData {
     /// Use the context to determine what events should be sent to complete this
@@ -56,11 +151,31 @@ pub struct MoveData {
     pub execute: &'static (dyn Fn(ExecuteCtx) + Send + Sync),
     /// Whether we've reached the target.
     pub is_reached: &'static (dyn Fn(IsReachedCtx) -> bool + Send + Sync),
+    /// Exact positions this movement may change, relative to its source node.
+    pub side_effects: MovementSideEffects,
+}
+
+impl MoveData {
+    pub(crate) fn new(
+        execute: &'static (dyn Fn(ExecuteCtx) + Send + Sync),
+        is_reached: &'static (dyn Fn(IsReachedCtx) -> bool + Send + Sync),
+    ) -> Self {
+        Self {
+            execute,
+            is_reached,
+            side_effects: MovementSideEffects::default(),
+        }
+    }
+
+    pub(crate) fn with_side_effects(mut self, side_effects: MovementSideEffects) -> Self {
+        self.side_effects = side_effects;
+        self
+    }
 }
 impl Debug for MoveData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MoveData")
-            // .field("move_kind", &self.move_kind)
+            .field("side_effects", &self.side_effects)
             .finish()
     }
 }
@@ -75,6 +190,7 @@ pub struct ExecuteCtx<'s, 'w1, 'w2, 'w3, 'w4, 'w5, 'w6, 'a> {
     pub physics: &'a azalea_entity::Physics,
     pub is_currently_mining: bool,
     pub can_mine: bool,
+    pub side_effects: MovementSideEffects,
     pub world: Arc<RwLock<World>>,
     pub menu: Menu,
 
@@ -151,6 +267,9 @@ impl ExecuteCtx<'_, '_, '_, '_, '_, '_, '_, '_> {
 
     /// Returns whether this block could be mined.
     pub fn should_mine(&mut self, block: BlockPos) -> bool {
+        if !self.side_effects.allows_break(self.start, block) {
+            return false;
+        }
         let block_state = self.world.read().get_block_state(block).unwrap_or_default();
         should_mine_block_state(block_state)
     }
@@ -159,7 +278,7 @@ impl ExecuteCtx<'_, '_, '_, '_, '_, '_, '_, '_> {
     ///
     /// Returns whether the block is being mined.
     pub fn mine(&mut self, block: BlockPos) -> bool {
-        if !self.can_mine {
+        if !self.can_mine || !self.side_effects.allows_break(self.start, block) {
             return false;
         }
 
@@ -264,4 +383,44 @@ pub struct MovesCtx<'a> {
     pub world: &'a CachedWorld,
     pub mining_cache: &'a MiningCache,
     pub custom_state: &'a CustomPathfinderStateRef,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn side_effects_resolve_relative_to_the_concrete_movement_source() {
+        let relative_source = RelBlockPos::new(12, 70, -8);
+        let first_break = relative_source.up(1);
+        let second_break = RelBlockPos::new(13, 70, -8);
+        let place = relative_source.down(1);
+        let side_effects =
+            MovementSideEffects::breaking(relative_source, [first_break, second_break])
+                .with_place(BlockOffset::between(relative_source, place));
+
+        let absolute_source = BlockPos::new(100, 70, -200);
+        assert_eq!(
+            side_effects
+                .blocks_to_break(absolute_source)
+                .collect::<Vec<_>>(),
+            [absolute_source.up(1), absolute_source.east(1)]
+        );
+        assert_eq!(
+            side_effects.block_to_place(absolute_source),
+            Some(absolute_source.down(1))
+        );
+        assert!(side_effects.allows_break(absolute_source, absolute_source.up(1)));
+        assert!(!side_effects.allows_break(absolute_source, absolute_source.west(1)));
+    }
+
+    #[test]
+    #[should_panic(expected = "a movement declared too many blocks to break")]
+    fn a_movement_cannot_declare_more_breaks_than_the_inline_capacity() {
+        let source = RelBlockPos::new(0, 64, 0);
+        let _ = MovementSideEffects::breaking_iter(
+            source,
+            (0..=MAX_BLOCKS_TO_BREAK_PER_MOVEMENT).map(|offset| source.up(offset as i32)),
+        );
+    }
 }

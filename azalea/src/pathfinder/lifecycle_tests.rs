@@ -115,10 +115,7 @@ fn one_edge_path() -> VecDeque<Edge<BlockPos, MoveData>> {
     VecDeque::from([Edge {
         movement: Movement {
             target: BlockPos::new(1, 64, 0),
-            data: MoveData {
-                execute: &execute_descend_move,
-                is_reached: &descend_is_reached,
-            },
+            data: MoveData::new(&execute_descend_move, &descend_is_reached),
         },
         cost: 1.0,
     }])
@@ -129,10 +126,7 @@ fn straight_path(len: usize) -> VecDeque<Edge<BlockPos, MoveData>> {
         .map(|x| Edge {
             movement: Movement {
                 target: BlockPos::new(x as i32, 64, 0),
-                data: MoveData {
-                    execute: &execute_descend_move,
-                    is_reached: &descend_is_reached,
-                },
+                data: MoveData::new(&execute_descend_move, &descend_is_reached),
             },
             cost: 1.0,
         })

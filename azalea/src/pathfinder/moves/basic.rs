@@ -7,7 +7,9 @@ use azalea_core::{
     position::{BlockPos, Vec3},
 };
 
-use super::{Edge, ExecuteCtx, IsReachedCtx, MoveData, MovesCtx, default_is_reached};
+use super::{
+    Edge, ExecuteCtx, IsReachedCtx, MoveData, MovementSideEffects, MovesCtx, default_is_reached,
+};
 use crate::pathfinder::{
     astar, costs::*, moves::BARITONE_COMPAT, player_pos_to_block_pos, positions::RelBlockPos,
 };
@@ -58,10 +60,9 @@ fn forward_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
         ctx.edges.push(Edge {
             movement: astar::Movement {
                 target: new_pos,
-                data: MoveData {
-                    execute: &execute_forward_move,
-                    is_reached: &default_is_reached,
-                },
+                data: MoveData::new(&execute_forward_move, &default_is_reached).with_side_effects(
+                    MovementSideEffects::breaking(pos, [new_pos, new_pos.up(1)]),
+                ),
             },
             cost,
         })
@@ -134,10 +135,12 @@ fn ascend_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
         ctx.edges.push(Edge {
             movement: astar::Movement {
                 target: pos + offset,
-                data: MoveData {
-                    execute: &execute_ascend_move,
-                    is_reached: &ascend_is_reached,
-                },
+                data: MoveData::new(&execute_ascend_move, &ascend_is_reached).with_side_effects(
+                    MovementSideEffects::breaking(
+                        pos,
+                        [pos.up(2), pos + offset, (pos + offset).up(1)],
+                    ),
+                ),
             },
             cost,
         })
@@ -313,10 +316,12 @@ fn descend_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
         ctx.edges.push(Edge {
             movement: astar::Movement {
                 target: new_position,
-                data: MoveData {
-                    execute: &execute_descend_move,
-                    is_reached: &descend_is_reached,
-                },
+                data: MoveData::new(&execute_descend_move, &descend_is_reached).with_side_effects(
+                    MovementSideEffects::breaking_iter(
+                        pos,
+                        (0..=(pos.y - new_position.y + 1)).map(|offset| new_position.up(offset)),
+                    ),
+                ),
             },
             cost,
         })
@@ -462,10 +467,7 @@ fn diagonal_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
         ctx.edges.push(Edge {
             movement: astar::Movement {
                 target: new_position,
-                data: MoveData {
-                    execute: &execute_diagonal_move,
-                    is_reached: &default_is_reached,
-                },
+                data: MoveData::new(&execute_diagonal_move, &default_is_reached),
             },
             cost,
         })
@@ -499,10 +501,8 @@ fn downward_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
     ctx.edges.push(Edge {
         movement: astar::Movement {
             target: pos.down(1),
-            data: MoveData {
-                execute: &execute_downward_move,
-                is_reached: &default_is_reached,
-            },
+            data: MoveData::new(&execute_downward_move, &default_is_reached)
+                .with_side_effects(MovementSideEffects::breaking(pos, [pos.down(1)])),
         },
         cost,
     })
