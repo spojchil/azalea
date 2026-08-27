@@ -22,6 +22,10 @@ pub const COST_HEURISTIC: f32 = 3.563;
 // breaking blocks if it can be avoided
 pub const BLOCK_BREAK_ADDITIONAL_PENALTY: f32 = 2.;
 
+// 放一格方块的代价。抄 baritone 的 blockPlacementPenalty 默认值：放置要转身、
+// 对准、发包、等服务端确认，比走一格贵得多，所以只有绕路明显更贵时才该选它。
+pub const BLOCK_PLACEMENT_PENALTY: f32 = 20.;
+
 pub static FALL_1_25_BLOCKS_COST: LazyLock<f32> = LazyLock::new(|| distance_to_ticks(1.25));
 pub static FALL_0_25_BLOCKS_COST: LazyLock<f32> = LazyLock::new(|| distance_to_ticks(0.25));
 pub static JUMP_ONE_BLOCK_COST: LazyLock<f32> =

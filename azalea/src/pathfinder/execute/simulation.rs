@@ -187,6 +187,7 @@ pub fn tick_execute_path(
                         physics,
                         is_currently_mining: mining.is_some(),
                         can_mine: executing_path.allow_mining,
+                        can_place: executing_path.allow_placing,
                         side_effects: edge.movement.data.side_effects,
                         world: world_holder.shared.clone(),
                         menu: inventory.inventory_menu.clone(),
@@ -477,6 +478,7 @@ fn run_one_simulation(
                     is_currently_mining: mining.is_some(),
                     // don't modify the world from the simulation
                     can_mine: false,
+                    can_place: false,
                     side_effects: next_node.movement.data.side_effects,
                     world: sim.world.clone(),
                     menu: inventory.inventory_menu.clone(),

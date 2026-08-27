@@ -10,10 +10,12 @@ use std::{
 use azalea_block::BlockState;
 use azalea_client::{
     PhysicsState, SprintDirection, StartSprintEvent, StartWalkEvent, WalkDirection,
-    inventory::SetSelectedHotbarSlotEvent, mining::StartMiningBlockEvent,
+    interact::StartUseItemQueued, inventory::SetSelectedHotbarSlotEvent,
+    mining::StartMiningBlockEvent,
 };
 use azalea_core::position::{BlockPos, Vec3};
 use azalea_inventory::Menu;
+use azalea_protocol::packets::game::s_interact::InteractionHand;
 use azalea_registry::builtin::BlockKind;
 use azalea_world::World;
 use bevy_ecs::{entity::Entity, message::MessageWriter, system::Commands, world::EntityWorldMut};
@@ -24,6 +26,7 @@ use super::{
     astar,
     custom_state::CustomPathfinderStateRef,
     mining::MiningCache,
+    placing::{PlacementCache, placeable_in_hotbar},
     positions::RelBlockPos,
     world::{CachedWorld, is_block_state_passable},
 };
@@ -246,6 +249,7 @@ pub struct ExecuteCtx<'s, 'w1, 'w2, 'w3, 'w4, 'w5, 'w6, 'a> {
     pub physics: &'a azalea_entity::Physics,
     pub is_currently_mining: bool,
     pub can_mine: bool,
+    pub can_place: bool,
     pub side_effects: MovementSideEffects,
     pub world: Arc<RwLock<World>>,
     pub menu: Menu,
@@ -365,6 +369,48 @@ impl ExecuteCtx<'_, '_, '_, '_, '_, '_, '_, '_> {
         true
     }
 
+    /// Place a block at the given position.
+    ///
+    /// Returns whether a placement was actually sent.
+    ///
+    /// 挖的对称面（见 [`ReplaceTarget`]）：同样只碰规划时声明过的坐标，同样先把
+    /// 手上换成合适的东西再动手。区别只在于换成的是方块而不是空气。
+    pub fn place(&mut self, block: BlockPos) -> bool {
+        if !self.can_place || !self.side_effects.allows_place(self.start, block) {
+            return false;
+        }
+        if !is_block_state_passable(self.get_block_state(block)) {
+            // 已经有东西了，不用放——和 mine 碰上已经是空气一样，这不是失败。
+            return false;
+        }
+
+        // 贴着下面那一格的上表面放：force_block 会伪造 Direction::Up 的命中，
+        // 于是方块正好落在 block 上。下面是空的就贴不住，什么也别发。
+        let against = block.down(1);
+        if is_block_state_passable(self.get_block_state(against)) {
+            return false;
+        }
+
+        let Some(slot) = placeable_in_hotbar(&self.menu) else {
+            return false;
+        };
+        self.commands.trigger(SetSelectedHotbarSlotEvent {
+            entity: self.entity,
+            slot: slot as u8,
+        });
+
+        self.walk(WalkDirection::None);
+        self.look_at_exact(against.center());
+        self.commands
+            .entity(self.entity)
+            .insert(StartUseItemQueued {
+                hand: InteractionHand::MainHand,
+                force_block: Some(against),
+            });
+
+        true
+    }
+
     /// Mine the given block, but make sure the player is standing at the start
     /// of the current node first.
     pub fn mine_while_at_start(&mut self, block: BlockPos) -> bool {
@@ -438,6 +484,8 @@ pub struct MovesCtx<'a> {
     pub edges: &'a mut Vec<Edge>,
     pub world: &'a CachedWorld,
     pub mining_cache: &'a MiningCache,
+    /// 规划期「能不能放、放一格多贵」的答案。挖和放是同一件事的两半。
+    pub placement: &'a PlacementCache,
     pub custom_state: &'a CustomPathfinderStateRef,
 }
 

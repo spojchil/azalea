@@ -24,6 +24,7 @@ use crate::pathfinder::{
     goals::BlockPosGoal,
     mining::MiningCache,
     moves,
+    placing::PlacementCache,
     positions::RelBlockPos,
     world::CachedWorld,
 };
@@ -81,12 +82,18 @@ pub fn check_for_path_obstruction(
         } else {
             None
         });
+        let placement_cache = PlacementCache::new(if opts.allow_placing {
+            Some(inventory.inventory_menu.clone())
+        } else {
+            None
+        });
         let custom_state = custom_state.cloned().unwrap_or_default();
         let custom_state_ref = custom_state.0.read();
         let successors = |pos: RelBlockPos| {
             call_successors_fn(
                 &cached_world,
                 &mining_cache,
+                &placement_cache,
                 &custom_state_ref,
                 opts.successors_fn,
                 pos,
@@ -189,6 +196,11 @@ pub fn patch_path(
     } else {
         None
     });
+    let placement_cache = PlacementCache::new(if opts.allow_placing {
+        Some(inventory.inventory_menu.clone())
+    } else {
+        None
+    });
 
     // the timeout is small enough that this doesn't need to be async
     let path_found_event = calculate_path(CalculatePathCtx {
@@ -198,6 +210,7 @@ pub fn patch_path(
         world_lock,
         goto_id_atomic,
         mining_cache,
+        placement_cache,
         custom_state,
         block_source,
         opts: PathfinderOpts {

@@ -106,6 +106,7 @@ pub fn tick_execute_path(
                 physics,
                 is_currently_mining: mining.is_some(),
                 can_mine: executing_path.allow_mining,
+                can_place: executing_path.allow_placing,
                 side_effects: edge.movement.data.side_effects,
                 world: world_holder.shared.clone(),
                 menu: inventory.inventory_menu.clone(),

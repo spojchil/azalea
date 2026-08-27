@@ -20,6 +20,7 @@ pub fn basic_move(ctx: &mut MovesCtx, node: RelBlockPos) {
     descend_move(ctx, node);
     diagonal_move(ctx, node);
     downward_move(ctx, node);
+    pillar_move(ctx, node);
 }
 
 fn forward_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
@@ -506,6 +507,103 @@ fn downward_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
         cost,
     })
 }
+/// Go directly up by placing a block under yourself mid-jump.
+///
+/// 抄 Baritone
+/// `MovementPillar`：破头顶上方那一格、在起点脚下放一块、落到它上面。
+/// 这是 A\* 里唯一一条**自己造出支撑**的边，所以不能拿 `cost_for_standing` 判断
+/// 落脚点——落脚点现在还是空的，正是这条边要把它填上。
+fn pillar_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
+    // 站在水里垫不了（Baritone 同样禁止：会被水冲走）。
+    if ctx.world.is_block_water(pos) {
+        return;
+    }
+    // 要有能贴的面：脚下那一格必须是实心的。
+    if !ctx.world.is_block_solid(pos.down(1)) {
+        return;
+    }
+
+    let place_cost = ctx.placement.cost_for_placing(pos, ctx.world);
+    if place_cost == f32::INFINITY {
+        return;
+    }
+
+    // 落脚之后头顶是 pos.up(2)，挡路就得先挖。
+    let break_cost = ctx
+        .world
+        .cost_for_breaking_block(pos.up(2), ctx.mining_cache);
+    if break_cost == f32::INFINITY {
+        return;
+    }
+
+    let cost = *JUMP_ONE_BLOCK_COST + JUMP_PENALTY + place_cost + break_cost;
+
+    ctx.edges.push(Edge {
+        movement: astar::Movement {
+            target: pos.up(1),
+            data: MoveData::new(&execute_pillar_move, &pillar_is_reached).with_side_effects(
+                MovementSideEffects::to_air(pos, [pos.up(2)]).and_solid(pos, pos),
+            ),
+        },
+        cost,
+    })
+}
+
+/// 跳到目标格的高度**不算**到达——半空中经过时脚下还是空的，这时候判成功会让
+/// 执行器把这条边交掉，身体随即掉回原处。落地才算数：
+/// 落得住就说明那一块真的放上了。
+fn pillar_is_reached(
+    IsReachedCtx {
+        position,
+        target,
+        physics,
+        ..
+    }: IsReachedCtx,
+) -> bool {
+    player_pos_to_block_pos(position) == target && physics.on_ground()
+}
+
+fn execute_pillar_move(mut ctx: ExecuteCtx) {
+    let ExecuteCtx {
+        start,
+        target,
+        position,
+        ..
+    } = ctx;
+
+    // 头顶挡路先挖，挖着的时候别跳。
+    if ctx.mine_while_at_start(start.up(2)) {
+        return;
+    }
+
+    // 全程蹲着：跳起来的时候不会走出这一格，右键也不会误触脚下方块的界面。
+    ctx.sneak();
+
+    // 没站正就先站正——偏出去放出来的柱子就歪了，人也踩不上。
+    let target_center = target.center();
+    let horizontal_distance = (target_center - position)
+        .horizontal_distance_squared()
+        .sqrt();
+    if horizontal_distance > 0.17 {
+        ctx.look_at(target_center);
+        ctx.walk(WalkDirection::Forward);
+        return;
+    }
+    ctx.walk(WalkDirection::None);
+
+    // 脚下已经垫好了，剩下的交给落地判定。
+    if !ctx.get_block_state(start).is_air() {
+        return;
+    }
+
+    // 身体得先让开 start 这一格才放得下去，所以跳到高过落脚点再放。
+    if position.y > f64::from(target.y) + 0.1 {
+        ctx.place(start);
+    } else {
+        ctx.jump();
+    }
+}
+
 fn execute_downward_move(mut ctx: ExecuteCtx) {
     let ExecuteCtx {
         target, position, ..
@@ -527,5 +625,135 @@ fn execute_downward_move(mut ctx: ExecuteCtx) {
         ctx.walk(WalkDirection::Forward);
     } else {
         ctx.walk(WalkDirection::None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use azalea_core::position::ChunkPos;
+    use azalea_inventory::{ItemStack, ItemStackData, Menu, Player};
+    use azalea_registry::builtin::{BlockKind, ItemKind};
+    use azalea_world::{Chunk, ChunkStorage, PartialWorld, World};
+    use parking_lot::RwLock;
+
+    use super::*;
+    use crate::pathfinder::{
+        custom_state::CustomPathfinderState, mining::MiningCache, placing::PlacementCache,
+        world::CachedWorld,
+    };
+
+    /// 一层地面，站在 origin，头顶全空。
+    fn world_with_floor(origin: BlockPos) -> (Arc<RwLock<World>>, PartialWorld) {
+        let mut partial_world = PartialWorld::default();
+        let mut chunks = ChunkStorage::default();
+        let floor = origin.down(1);
+        partial_world
+            .chunks
+            .set(&ChunkPos::from(floor), Some(Chunk::default()), &mut chunks);
+        partial_world
+            .chunks
+            .set_block_state(floor, BlockKind::Stone.into(), &chunks);
+        (Arc::new(RwLock::new(chunks.into())), partial_world)
+    }
+
+    fn hotbar_holding(kind: ItemKind) -> Menu {
+        let mut menu = Menu::Player(Player::default());
+        let first = *menu.hotbar_slots_range().start();
+        *menu.slot_mut(first).expect("快捷栏第一格存在") =
+            ItemStack::Present(ItemStackData::new(kind, 64));
+        menu
+    }
+
+    fn pillar_edges(
+        world: Arc<RwLock<World>>,
+        origin: BlockPos,
+        placement: PlacementCache,
+    ) -> Vec<Edge> {
+        let cached_world = CachedWorld::new(world, origin);
+        let mining_cache = MiningCache::new(Some(Menu::Player(Player::default())));
+        let custom_state = CustomPathfinderState::default();
+        let custom_state_ref = custom_state.0.read();
+
+        let mut edges = Vec::new();
+        let mut ctx = MovesCtx {
+            edges: &mut edges,
+            world: &cached_world,
+            mining_cache: &mining_cache,
+            placement: &placement,
+            custom_state: &custom_state_ref,
+        };
+        pillar_move(&mut ctx, RelBlockPos::get_origin(origin));
+        edges
+    }
+
+    fn on_floor(placement: PlacementCache) -> Vec<Edge> {
+        let origin = BlockPos::new(0, 1, 0);
+        let (world, _owner) = world_with_floor(origin);
+        pillar_edges(world, origin, placement)
+    }
+
+    /// 没有可放的方块就不该生出垫柱边——否则 A* 会规划一条执行不了的路。
+    #[test]
+    fn without_anything_to_place_there_is_no_pillar() {
+        assert!(on_floor(PlacementCache::new(None)).is_empty());
+        assert!(
+            on_floor(PlacementCache::new(Some(hotbar_holding(
+                ItemKind::DiamondPickaxe
+            ))))
+            .is_empty(),
+            "手上只有镐子也垫不了"
+        );
+    }
+
+    /// 有料就该多出一条往上一格的边，声明的替换正是「脚下变实心、
+    /// 头顶上方变空气」。
+    #[test]
+    fn a_pillar_declares_the_block_it_will_stand_on() {
+        let edges = on_floor(PlacementCache::new(Some(hotbar_holding(
+            ItemKind::Cobblestone,
+        ))));
+        assert_eq!(edges.len(), 1, "脚下有实心、头顶空着时恰好一条垫柱边");
+
+        let origin = BlockPos::new(0, 1, 0);
+        let edge = &edges[0];
+        assert_eq!(edge.movement.target.apply(origin), origin.up(1));
+
+        let side_effects = edge.movement.data.side_effects;
+        assert_eq!(
+            side_effects.block_to_place(origin),
+            Some(origin),
+            "垫的就是当前站的这一格"
+        );
+        assert_eq!(
+            side_effects.blocks_to_break(origin).collect::<Vec<_>>(),
+            [origin.up(2)],
+            "只允许挖落脚之后的头顶那一格"
+        );
+        assert!(
+            edge.cost > BLOCK_PLACEMENT_PENALTY,
+            "放置代价必须计入，否则 A* 会当它和走路一样便宜"
+        );
+    }
+
+    /// 脚下悬空时贴不住，不该生出垫柱边。
+    #[test]
+    fn a_pillar_needs_something_to_place_against() {
+        let origin = BlockPos::new(0, 1, 0);
+        let mut partial_world = PartialWorld::default();
+        let mut chunks = ChunkStorage::default();
+        partial_world
+            .chunks
+            .set(&ChunkPos::from(origin), Some(Chunk::default()), &mut chunks);
+        let world: Arc<RwLock<World>> = Arc::new(RwLock::new(chunks.into()));
+        let _owner = partial_world;
+
+        let edges = pillar_edges(
+            world,
+            origin,
+            PlacementCache::new(Some(hotbar_holding(ItemKind::Cobblestone))),
+        );
+        assert!(edges.is_empty());
     }
 }

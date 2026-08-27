@@ -67,6 +67,7 @@ impl GotoEvent {
 pub struct PathfinderOpts {
     pub(crate) successors_fn: SuccessorsFn,
     pub(crate) allow_mining: bool,
+    pub(crate) allow_placing: bool,
     pub(crate) retry_on_no_path: bool,
     pub(crate) recalculate_partial_paths: bool,
     pub(crate) min_timeout: PathfinderTimeout,
@@ -78,6 +79,7 @@ impl PathfinderOpts {
         Self {
             successors_fn: moves::default_move,
             allow_mining: true,
+            allow_placing: true,
             retry_on_no_path: true,
             recalculate_partial_paths: true,
             min_timeout: PathfinderTimeout::Time(Duration::from_secs(1)),
@@ -96,6 +98,17 @@ impl PathfinderOpts {
     /// Defaults to `true`.
     pub fn allow_mining(mut self, allow_mining: bool) -> Self {
         self.allow_mining = allow_mining;
+        self
+    }
+    /// Set whether the bot is allowed to place blocks while pathfinding.
+    ///
+    /// Placing is the same operation as mining with a different target, so this
+    /// is the placing half of the same permission: it gates whether a planned
+    /// edge may declare a solid replacement (pillaring, bridging).
+    ///
+    /// Defaults to `true`.
+    pub fn allow_placing(mut self, allow_placing: bool) -> Self {
+        self.allow_placing = allow_placing;
         self
     }
     /// Whether we should recalculate the path when the pathfinder timed out and

@@ -24,6 +24,7 @@ mod goto_event;
 mod lifecycle_tests;
 pub mod mining;
 pub mod moves;
+pub mod placing;
 pub mod positions;
 pub mod simulation;
 #[cfg(test)]
@@ -61,6 +62,7 @@ use tracing::{debug, error, info, warn};
 
 use self::{
     debug::debug_render_path_with_particles, goals::Goal, mining::MiningCache, moves::SuccessorsFn,
+    placing::PlacementCache,
 };
 use crate::{
     Client, WalkDirection,
@@ -150,6 +152,10 @@ pub struct ExecutingPath {
     /// because the opts are cleared on retirement while the path is still
     /// executing.
     pub allow_mining: bool,
+    /// Whether the plan that produced this path was allowed to place.
+    /// Same reasoning as [`Self::allow_mining`]: the executor must never be
+    /// more permissive than the planner was.
+    pub allow_placing: bool,
 }
 impl ExecutingPath {
     pub fn is_empty_queued_path(&self) -> bool {
@@ -170,6 +176,7 @@ pub struct PathFoundEvent {
     pub is_partial: bool,
     pub successors_fn: SuccessorsFn,
     pub allow_mining: bool,
+    pub allow_placing: bool,
 }
 
 #[allow(clippy::type_complexity)]
@@ -473,11 +480,15 @@ pub fn goto_listener(
         let entity = event.entity;
 
         let allow_mining = event.opts.allow_mining;
-        let inventory_menu = if allow_mining {
+        let allow_placing = event.opts.allow_placing;
+        // 挖和放都要问库存：挖要挑工具，放要有料。
+        let inventory_menu = if allow_mining || allow_placing {
             Some(inventory.inventory_menu.clone())
         } else {
             None
         };
+        let mining_menu = allow_mining.then(|| inventory_menu.clone()).flatten();
+        let placing_menu = allow_placing.then(|| inventory_menu.clone()).flatten();
 
         let custom_state = custom_state.cloned().unwrap_or_default();
         let opts = event.opts.clone();
@@ -508,7 +519,8 @@ pub fn goto_listener(
                     goal: goal.clone(),
                     world_lock: world_lock.clone(),
                     goto_id_atomic: goto_id_atomic.clone(),
-                    mining_cache: MiningCache::new(inventory_menu.clone()),
+                    mining_cache: MiningCache::new(mining_menu.clone()),
+                    placement_cache: PlacementCache::new(placing_menu.clone()),
                     custom_state: custom_state.clone(),
                     block_source: block_source.clone(),
                     opts: PathfinderOpts {
@@ -574,7 +586,8 @@ pub fn goto_listener(
             );
         }
 
-        let mining_cache = MiningCache::new(inventory_menu);
+        let mining_cache = MiningCache::new(mining_menu);
+        let placement_cache = PlacementCache::new(placing_menu);
         let task = thread_pool.spawn(async move {
             calculate_path_at_generation(
                 CalculatePathCtx {
@@ -584,6 +597,7 @@ pub fn goto_listener(
                     world_lock,
                     goto_id_atomic,
                     mining_cache,
+                    placement_cache,
                     custom_state,
                     block_source,
                     opts,
@@ -629,6 +643,7 @@ pub struct CalculatePathCtx {
     pub world_lock: Arc<RwLock<azalea_world::World>>,
     pub goto_id_atomic: Arc<AtomicUsize>,
     pub mining_cache: MiningCache,
+    pub placement_cache: PlacementCache,
     pub custom_state: CustomPathfinderState,
     /// `None` plans over the loaded world; `Some` plans over that source only.
     pub block_source: Option<Arc<dyn world::BlockSource>>,
@@ -664,6 +679,7 @@ fn calculate_path_at_generation(
         call_successors_fn(
             &cached_world,
             &ctx.mining_cache,
+            &ctx.placement_cache,
             &ctx.custom_state.0.read(),
             ctx.opts.successors_fn,
             pos,
@@ -752,6 +768,7 @@ fn calculate_path_at_generation(
         is_partial,
         successors_fn: ctx.opts.successors_fn,
         allow_mining: ctx.opts.allow_mining,
+        allow_placing: ctx.opts.allow_placing,
     })
 }
 
@@ -864,12 +881,18 @@ pub fn path_found_listener(
                     } else {
                         None
                     });
+                    let placement_cache = PlacementCache::new(if event.allow_placing {
+                        Some(inventory.inventory_menu.clone())
+                    } else {
+                        None
+                    });
                     let custom_state = custom_state.cloned().unwrap_or_default();
                     let custom_state_ref = custom_state.0.read();
                     let successors = |pos: RelBlockPos| {
                         call_successors_fn(
                             &cached_world,
                             &mining_cache,
+                            &placement_cache,
                             &custom_state_ref,
                             successors_fn,
                             pos,
@@ -910,6 +933,7 @@ pub fn path_found_listener(
                 executing_path.queued_path = Some(new_path);
                 executing_path.is_path_partial = event.is_partial;
                 executing_path.allow_mining = event.allow_mining;
+                executing_path.allow_placing = event.allow_placing;
             } else {
                 commands.entity(event.entity).insert(ExecutingPath {
                     path: found_path.to_owned(),
@@ -918,6 +942,7 @@ pub fn path_found_listener(
                     ticks_since_last_node_reached: 0,
                     is_path_partial: event.is_partial,
                     allow_mining: event.allow_mining,
+                    allow_placing: event.allow_placing,
                 });
                 debug!(
                     "set path to {:?}",
@@ -1068,6 +1093,7 @@ pub fn stop_pathfinding_on_world_change(
 pub fn call_successors_fn(
     cached_world: &CachedWorld,
     mining_cache: &MiningCache,
+    placement_cache: &PlacementCache,
     custom_state: &CustomPathfinderStateRef,
     successors_fn: SuccessorsFn,
     pos: RelBlockPos,
@@ -1077,6 +1103,7 @@ pub fn call_successors_fn(
         edges: &mut edges,
         world: cached_world,
         mining_cache,
+        placement: placement_cache,
         custom_state,
     };
     successors_fn(&mut ctx, pos);
