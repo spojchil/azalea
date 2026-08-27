@@ -49,7 +49,8 @@ pub fn default_move(ctx: &mut MovesCtx, node: RelBlockPos) {
     uncommon::uncommon_move(ctx, node);
 }
 
-const MAX_BLOCKS_TO_BREAK_PER_MOVEMENT: usize = 5;
+/// 一次移动最多声明几处世界替换。挖和放共用这个额度——它们是同一件事。
+const MAX_REPLACEMENTS_PER_MOVEMENT: usize = 6;
 
 /// A block position relative to the source node of a movement.
 ///
@@ -77,69 +78,124 @@ impl BlockOffset {
     }
 }
 
-/// The exact world-changing positions a movement is allowed to touch.
+/// 替换之后那一格应该是什么。
 ///
-/// This mirrors Baritone's `positionsToBreak` / `positionToPlace` contract:
-/// movement execution may react to the world changing, but it may never mine
-/// or place outside the positions declared by the planned edge.
+/// 挖和放不是两件事：挖是把一格换成空气，放是把一格换成实心方块。规划期只关心
+/// 「换完之后这里能不能通行、能不能站」，具体放哪一种方块是执行期按库存挑的。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplaceTarget {
+    /// 空气。执行期表现为挖掉这一格。
+    Air,
+    /// 一块实心方块。执行期表现为放置。
+    Solid,
+}
+
+/// 一处世界替换：把 `at` 这一格换成 `to`。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Replacement {
+    at: BlockOffset,
+    to: ReplaceTarget,
+}
+
+impl Replacement {
+    /// Resolve this replacement's position for a concrete movement source.
+    pub fn at(&self, source: BlockPos) -> BlockPos {
+        self.at.apply(source)
+    }
+
+    pub fn target(&self) -> ReplaceTarget {
+        self.to
+    }
+}
+
+/// The exact world changes a movement is allowed to make.
+///
+/// Baritone keeps these in two places (`positionsToBreak` / `positionToPlace`);
+/// here they are one list, because breaking and placing are the same operation
+/// with a different target. Movement execution may react to the world changing,
+/// but it may never touch a position this planned edge did not declare.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MovementSideEffects {
-    blocks_to_break: [Option<BlockOffset>; MAX_BLOCKS_TO_BREAK_PER_MOVEMENT],
-    block_to_place: Option<BlockOffset>,
+    replacements: [Option<Replacement>; MAX_REPLACEMENTS_PER_MOVEMENT],
 }
 
 impl MovementSideEffects {
-    pub(crate) fn breaking<const N: usize>(source: RelBlockPos, blocks: [RelBlockPos; N]) -> Self {
-        Self::default().with_breaks(blocks.map(|block| BlockOffset::between(source, block)))
+    /// 声明这些格会被挖成空气。
+    pub(crate) fn to_air<const N: usize>(source: RelBlockPos, blocks: [RelBlockPos; N]) -> Self {
+        Self::to_air_iter(source, blocks)
     }
 
-    pub(crate) fn breaking_iter(
+    pub(crate) fn to_air_iter(
         source: RelBlockPos,
         blocks: impl IntoIterator<Item = RelBlockPos>,
     ) -> Self {
         let mut side_effects = Self::default();
-        for (index, block) in blocks.into_iter().enumerate() {
-            assert!(
-                index < MAX_BLOCKS_TO_BREAK_PER_MOVEMENT,
-                "a movement declared too many blocks to break"
-            );
-            side_effects.blocks_to_break[index] = Some(BlockOffset::between(source, block));
+        for block in blocks {
+            side_effects.push(source, block, ReplaceTarget::Air);
         }
         side_effects
     }
 
-    pub(crate) fn with_breaks<const N: usize>(mut self, blocks: [BlockOffset; N]) -> Self {
-        assert!(
-            N <= MAX_BLOCKS_TO_BREAK_PER_MOVEMENT,
-            "a movement declared too many blocks to break"
-        );
-        for (slot, block) in self.blocks_to_break.iter_mut().zip(blocks) {
-            *slot = Some(block);
-        }
-        self
-    }
-
+    /// 追加声明：这一格会被放上实心方块。
     #[allow(dead_code)]
-    pub(crate) fn with_place(mut self, block: BlockOffset) -> Self {
-        self.block_to_place = Some(block);
+    pub(crate) fn and_solid(mut self, source: RelBlockPos, block: RelBlockPos) -> Self {
+        self.push(source, block, ReplaceTarget::Solid);
         self
     }
 
-    /// Resolve the declared break positions for a concrete movement source.
-    pub fn blocks_to_break(&self, source: BlockPos) -> impl Iterator<Item = BlockPos> + use<'_> {
-        self.blocks_to_break
+    fn push(&mut self, source: RelBlockPos, block: RelBlockPos, to: ReplaceTarget) {
+        let slot = self
+            .replacements
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .expect("a movement declared too many world replacements");
+        *slot = Some(Replacement {
+            at: BlockOffset::between(source, block),
+            to,
+        });
+    }
+
+    /// Resolve every declared replacement for a concrete movement source.
+    pub fn replacements(
+        &self,
+        source: BlockPos,
+    ) -> impl Iterator<Item = (BlockPos, ReplaceTarget)> + use<'_> {
+        self.replacements
             .iter()
             .flatten()
-            .map(move |offset| offset.apply(source))
+            .map(move |replacement| (replacement.at.apply(source), replacement.to))
     }
 
-    /// Resolve the declared placement position for a concrete movement source.
+    /// 声明里要换成空气的那些格——也就是允许挖的坐标。
+    pub fn blocks_to_break(&self, source: BlockPos) -> impl Iterator<Item = BlockPos> + use<'_> {
+        self.declared(source, ReplaceTarget::Air)
+    }
+
+    /// 声明里要换成实心的第一格——也就是允许放的坐标。
     pub fn block_to_place(&self, source: BlockPos) -> Option<BlockPos> {
-        self.block_to_place.map(|offset| offset.apply(source))
+        self.declared(source, ReplaceTarget::Solid).next()
+    }
+
+    fn declared(
+        &self,
+        source: BlockPos,
+        target: ReplaceTarget,
+    ) -> impl Iterator<Item = BlockPos> + use<'_> {
+        self.replacements
+            .iter()
+            .flatten()
+            .filter(move |replacement| replacement.to == target)
+            .map(move |replacement| replacement.at.apply(source))
     }
 
     fn allows_break(&self, source: BlockPos, block: BlockPos) -> bool {
         self.blocks_to_break(source)
+            .any(|declared| declared == block)
+    }
+
+    #[allow(dead_code)]
+    fn allows_place(&self, source: BlockPos, block: BlockPos) -> bool {
+        self.declared(source, ReplaceTarget::Solid)
             .any(|declared| declared == block)
     }
 }
@@ -396,8 +452,8 @@ mod tests {
         let second_break = RelBlockPos::new(13, 70, -8);
         let place = relative_source.down(1);
         let side_effects =
-            MovementSideEffects::breaking(relative_source, [first_break, second_break])
-                .with_place(BlockOffset::between(relative_source, place));
+            MovementSideEffects::to_air(relative_source, [first_break, second_break])
+                .and_solid(relative_source, place);
 
         let absolute_source = BlockPos::new(100, 70, -200);
         assert_eq!(
@@ -414,13 +470,37 @@ mod tests {
         assert!(!side_effects.allows_break(absolute_source, absolute_source.west(1)));
     }
 
+    /// 挖和放共用一份清单，所以「允许挖」和「允许放」不能互相顶替：声明放一格
+    /// 不等于允许把它挖了，反过来也一样。
     #[test]
-    #[should_panic(expected = "a movement declared too many blocks to break")]
-    fn a_movement_cannot_declare_more_breaks_than_the_inline_capacity() {
+    fn a_declared_placement_is_not_permission_to_mine_the_same_position() {
         let source = RelBlockPos::new(0, 64, 0);
-        let _ = MovementSideEffects::breaking_iter(
+        let floor = source.down(1);
+        let head = source.up(1);
+        let side_effects = MovementSideEffects::to_air(source, [head]).and_solid(source, floor);
+
+        let at = BlockPos::new(-30, 64, 12);
+        assert!(side_effects.allows_place(at, at.down(1)));
+        assert!(!side_effects.allows_break(at, at.down(1)));
+        assert!(side_effects.allows_break(at, at.up(1)));
+        assert!(!side_effects.allows_place(at, at.up(1)));
+
+        assert_eq!(
+            side_effects.replacements(at).collect::<Vec<_>>(),
+            [
+                (at.up(1), ReplaceTarget::Air),
+                (at.down(1), ReplaceTarget::Solid),
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a movement declared too many world replacements")]
+    fn a_movement_cannot_declare_more_replacements_than_the_inline_capacity() {
+        let source = RelBlockPos::new(0, 64, 0);
+        let _ = MovementSideEffects::to_air_iter(
             source,
-            (0..=MAX_BLOCKS_TO_BREAK_PER_MOVEMENT).map(|offset| source.up(offset as i32)),
+            (0..=MAX_REPLACEMENTS_PER_MOVEMENT).map(|offset| source.up(offset as i32)),
         );
     }
 }

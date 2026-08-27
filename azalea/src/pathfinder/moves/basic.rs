@@ -60,9 +60,8 @@ fn forward_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
         ctx.edges.push(Edge {
             movement: astar::Movement {
                 target: new_pos,
-                data: MoveData::new(&execute_forward_move, &default_is_reached).with_side_effects(
-                    MovementSideEffects::breaking(pos, [new_pos, new_pos.up(1)]),
-                ),
+                data: MoveData::new(&execute_forward_move, &default_is_reached)
+                    .with_side_effects(MovementSideEffects::to_air(pos, [new_pos, new_pos.up(1)])),
             },
             cost,
         })
@@ -136,7 +135,7 @@ fn ascend_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
             movement: astar::Movement {
                 target: pos + offset,
                 data: MoveData::new(&execute_ascend_move, &ascend_is_reached).with_side_effects(
-                    MovementSideEffects::breaking(
+                    MovementSideEffects::to_air(
                         pos,
                         [pos.up(2), pos + offset, (pos + offset).up(1)],
                     ),
@@ -317,7 +316,7 @@ fn descend_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
             movement: astar::Movement {
                 target: new_position,
                 data: MoveData::new(&execute_descend_move, &descend_is_reached).with_side_effects(
-                    MovementSideEffects::breaking_iter(
+                    MovementSideEffects::to_air_iter(
                         pos,
                         (0..=(pos.y - new_position.y + 1)).map(|offset| new_position.up(offset)),
                     ),
@@ -502,7 +501,7 @@ fn downward_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
         movement: astar::Movement {
             target: pos.down(1),
             data: MoveData::new(&execute_downward_move, &default_is_reached)
-                .with_side_effects(MovementSideEffects::breaking(pos, [pos.down(1)])),
+                .with_side_effects(MovementSideEffects::to_air(pos, [pos.down(1)])),
         },
         cost,
     })
