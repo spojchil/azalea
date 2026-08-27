@@ -36,7 +36,9 @@ const MAX_VIEW_DISTANCE: usize = 32;
 /// `None` means **unknown**. It is replaced with
 /// [`BlockSource::missing_block_state`], which defaults to air for backwards
 /// compatibility. Strict sources can return an unwalkable, non-standable state
-/// there so unknown cells never enter the executable graph.
+/// there so unknown cells never enter the executable graph. Mining costs never
+/// fall through to the loaded world: an unknown cell can only inherit the
+/// fallback's geometry, and is never treated as a known block to break.
 pub trait BlockSource: Send + Sync {
     fn get_block_state(&self, pos: BlockPos) -> Option<BlockState>;
 
@@ -45,11 +47,8 @@ pub trait BlockSource: Send + Sync {
     }
 }
 
-/// Install a [`BlockSource`] on an entity so initial search, non-mining
+/// Install a [`BlockSource`] on an entity so initial search, mining costs,
 /// replanning, and path patching use it instead of the loaded world.
-///
-/// The mining-cost path still reads loaded chunk sections directly. Callers
-/// that require a strict knowledge boundary must set `allow_mining(false)`.
 #[derive(bevy_ecs::component::Component, Clone)]
 pub struct PathfinderBlockSource(pub Arc<dyn BlockSource>);
 
@@ -439,6 +438,30 @@ impl CachedWorld {
         pos: RelBlockPos,
         mining_cache: &MiningCache,
     ) -> f32 {
+        if let Some(source) = &self.block_source {
+            let block_state = match source.get_block_state(pos.apply(self.origin)) {
+                Some(block_state) => block_state,
+                None => {
+                    // Preserve the source's declared geometry for unknown cells
+                    // without ever consulting or mining the hidden loaded world.
+                    return if is_block_state_passable(source.missing_block_state()) {
+                        0.
+                    } else {
+                        f32::INFINITY
+                    };
+                }
+            };
+            if is_block_state_passable(block_state) {
+                return 0.;
+            }
+            return self.uncached_cost_for_breaking_block_from_source(
+                pos,
+                mining_cache,
+                source.as_ref(),
+                block_state,
+            );
+        }
+
         if self.is_block_passable(pos) {
             // if the block is passable then it doesn't need to be broken
             return 0.;
@@ -580,6 +603,49 @@ impl CachedWorld {
             && check_should_avoid_this_block(self, pos.west(1), |b| mining_cache.is_liquid(b))
         {
             return f32::INFINITY;
+        }
+
+        if is_falling_block_above {
+            mining_cost += self.cost_for_breaking_block(rel_pos.up(1), mining_cache);
+        }
+
+        mining_cost
+    }
+
+    /// Calculate mining cost without consulting the loaded world.
+    ///
+    /// In particular, a source's `None` for the target cannot fall through to
+    /// a raw chunk that happens to contain that block. Neighbor safety checks
+    /// use the same source and its configured missing-state semantics.
+    fn uncached_cost_for_breaking_block_from_source(
+        &self,
+        rel_pos: RelBlockPos,
+        mining_cache: &MiningCache,
+        source: &dyn BlockSource,
+        block_state: BlockState,
+    ) -> f32 {
+        let pos = rel_pos.apply(self.origin);
+        let mut mining_cost = mining_cache.cost_for(block_state);
+        if mining_cost == f32::INFINITY {
+            return f32::INFINITY;
+        }
+
+        let state_or_missing = |pos| {
+            source
+                .get_block_state(pos)
+                .unwrap_or_else(|| source.missing_block_state())
+        };
+
+        let up_block = state_or_missing(pos.up(1));
+        if mining_cache.is_liquid(up_block) {
+            return f32::INFINITY;
+        }
+        let is_falling_block_above = mining_cache.is_falling_block(up_block);
+
+        for neighbor in [pos.north(1), pos.east(1), pos.south(1), pos.west(1)] {
+            if mining_cache.is_liquid(state_or_missing(neighbor)) {
+                return f32::INFINITY;
+            }
         }
 
         if is_falling_block_above {
@@ -818,6 +884,9 @@ pub fn is_block_state_water(block_state: BlockState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use azalea_inventory::{Menu, Player};
     use azalea_world::{Chunk, ChunkStorage, PartialWorld};
 
     use super::*;
@@ -842,6 +911,40 @@ mod tests {
         }
     }
 
+    struct KnownBlocks {
+        blocks: HashMap<BlockPos, BlockState>,
+        missing: BlockState,
+    }
+
+    impl BlockSource for KnownBlocks {
+        fn get_block_state(&self, pos: BlockPos) -> Option<BlockState> {
+            self.blocks.get(&pos).copied()
+        }
+
+        fn missing_block_state(&self) -> BlockState {
+            self.missing
+        }
+    }
+
+    fn world_with_block(
+        pos: BlockPos,
+        block_state: BlockState,
+    ) -> (Arc<RwLock<World>>, PartialWorld) {
+        let mut partial_world = PartialWorld::default();
+        let mut chunks = ChunkStorage::default();
+        partial_world
+            .chunks
+            .set(&ChunkPos::from(pos), Some(Chunk::default()), &mut chunks);
+        partial_world
+            .chunks
+            .set_block_state(pos, block_state, &chunks);
+        (Arc::new(RwLock::new(chunks.into())), partial_world)
+    }
+
+    fn mining_cache_with_empty_inventory() -> MiningCache {
+        MiningCache::new(Some(Menu::Player(Player::default())))
+    }
+
     #[test]
     fn a_block_source_controls_how_unknown_cells_enter_the_graph() {
         let section = SmallChunkSectionPos::from(BlockPos::new(0, 0, 0));
@@ -864,6 +967,93 @@ mod tests {
             direct.get_block_state_at_pos(BlockPos::default()),
             BlockState::from(BlockKind::Fire),
             "direct state reads and section bitsets must share the fallback"
+        );
+    }
+
+    #[test]
+    fn a_block_source_controls_mining_targets_without_loaded_world_fallback() {
+        let target = BlockPos::new(0, 1, 0);
+        let rel_target = RelBlockPos::from_origin(BlockPos::default(), target);
+        let mining_cache = mining_cache_with_empty_inventory();
+
+        let (stone_world, _stone_world_owner) = world_with_block(target, BlockKind::Stone.into());
+        let loaded_world = CachedWorld::new(stone_world.clone(), BlockPos::default());
+        assert!(
+            loaded_world
+                .cost_for_breaking_block(rel_target, &mining_cache)
+                .is_finite(),
+            "the raw stone fixture must be mineable"
+        );
+
+        let strict_unknown = CachedWorld::new(stone_world, BlockPos::default())
+            .with_block_source(Arc::new(StrictUnknown));
+        assert_eq!(
+            strict_unknown.cost_for_breaking_block(rel_target, &mining_cache),
+            f32::INFINITY,
+            "an unknown target must not fall through to a loaded raw chunk"
+        );
+
+        let (optimistic_world, _optimistic_world_owner) =
+            world_with_block(target, BlockKind::Stone.into());
+        let optimistic_unknown = CachedWorld::new(optimistic_world, BlockPos::default())
+            .with_block_source(Arc::new(DefaultUnknown));
+        assert_eq!(
+            optimistic_unknown.cost_for_breaking_block(rel_target, &mining_cache),
+            0.,
+            "an optimistic source may expose unknown geometry as air without mining it"
+        );
+
+        let (bedrock_world, _bedrock_world_owner) =
+            world_with_block(target, BlockKind::Bedrock.into());
+        let loaded_world = CachedWorld::new(bedrock_world.clone(), BlockPos::default());
+        assert_eq!(
+            loaded_world.cost_for_breaking_block(rel_target, &mining_cache),
+            f32::INFINITY,
+            "the raw bedrock fixture must be unmineable"
+        );
+
+        let source = KnownBlocks {
+            blocks: HashMap::from([(target, BlockKind::Stone.into())]),
+            missing: BlockKind::Fire.into(),
+        };
+        let source_world = CachedWorld::new(bedrock_world, BlockPos::default())
+            .with_block_source(Arc::new(source));
+        assert!(
+            source_world
+                .cost_for_breaking_block(rel_target, &mining_cache)
+                .is_finite(),
+            "a known source block must take precedence over hidden raw bedrock"
+        );
+    }
+
+    #[test]
+    fn mining_safety_neighbors_are_read_from_the_block_source() {
+        let target = BlockPos::new(0, 1, 0);
+        let rel_target = RelBlockPos::from_origin(BlockPos::default(), target);
+        let mining_cache = mining_cache_with_empty_inventory();
+        let (raw_world, _raw_world_owner) = world_with_block(target, BlockKind::Stone.into());
+
+        let loaded_world = CachedWorld::new(raw_world.clone(), BlockPos::default());
+        assert!(
+            loaded_world
+                .cost_for_breaking_block(rel_target, &mining_cache)
+                .is_finite(),
+            "the raw fixture has no liquid around the target"
+        );
+
+        let source = KnownBlocks {
+            blocks: HashMap::from([
+                (target, BlockKind::Stone.into()),
+                (target.up(1), BlockKind::Water.into()),
+            ]),
+            missing: BlockKind::Fire.into(),
+        };
+        let source_world =
+            CachedWorld::new(raw_world, BlockPos::default()).with_block_source(Arc::new(source));
+        assert_eq!(
+            source_world.cost_for_breaking_block(rel_target, &mining_cache),
+            f32::INFINITY,
+            "liquid visible only through the source must still prevent mining"
         );
     }
 
