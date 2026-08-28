@@ -39,7 +39,7 @@ use crate::{
     attack::handle_attack_event,
     interact::pick::{HitResultComponent, update_hit_result_component},
     inventory::InventorySystems,
-    local_player::{LocalGameMode, PermissionLevel},
+    local_player::{LocalGameMode, PermissionLevel, WorldHolder},
     movement::MoveEventsSystems,
     packet::game::SendGamePacketEvent,
     respawn::perform_respawn,
@@ -246,10 +246,20 @@ pub fn handle_start_use_item_queued(
         &HitResultComponent,
         &LookDirection,
         Option<&Mining>,
+        &WorldHolder,
+        &Position,
     )>,
 ) {
-    for (entity, start_use_item, mut prediction_handler, hit_result, look_direction, mining) in
-        query
+    for (
+        entity,
+        start_use_item,
+        mut prediction_handler,
+        hit_result,
+        look_direction,
+        mining,
+        world_holder,
+        position,
+    ) in query
     {
         commands.entity(entity).remove::<StartUseItemQueued>();
 
@@ -296,6 +306,25 @@ pub fn handle_start_use_item_queued(
                         },
                     ));
                 } else {
+                    // Register the block this use may create (hit face's
+                    // neighbor) as a pending prediction, keeping the server's
+                    // current state there. A subsequent server block update at
+                    // that position then confirms as one of our own changes
+                    // (see `ConfirmedSelfBlockUpdates`) instead of a passive
+                    // update. If the use doesn't change the block (opening a
+                    // container, being rejected, ...), the ack clears the entry
+                    // with no rollback because the retained state is the real
+                    // current one.
+                    let use_target = r.block_pos + r.direction.normal();
+                    let current_state = {
+                        let world = world_holder.shared.read();
+                        world.get_block_state(use_target).unwrap_or_default()
+                    };
+                    prediction_handler.retain_known_server_state(
+                        use_target,
+                        current_state,
+                        **position,
+                    );
                     commands.trigger(SendGamePacketEvent::new(
                         entity,
                         ServerboundUseItemOn {
