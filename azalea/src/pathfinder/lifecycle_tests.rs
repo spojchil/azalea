@@ -111,6 +111,11 @@ fn active_pathfinder() -> Pathfinder {
     }
 }
 
+/// 测试夹具：没装策略，只有调用方的挖掘开关；放置一律关。
+fn policy_for(allow_mining: bool) -> super::policy::PolicySnapshot {
+    super::policy::PolicySnapshot::new(None, allow_mining, false)
+}
+
 fn one_edge_path() -> VecDeque<Edge<BlockPos, MoveData>> {
     VecDeque::from([Edge {
         movement: Movement {
@@ -234,8 +239,7 @@ fn stale_path_result_cannot_revive_a_stopped_or_replaced_request() {
         path: Some(one_edge_path()),
         is_partial: false,
         successors_fn: moves::default_move,
-        allow_mining: false,
-        allow_placing: false,
+        policy: policy_for(false),
     });
 
     app.update();
@@ -406,8 +410,7 @@ fn timeout_does_not_patch_an_old_leg_after_replacement_listener_consumption() {
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 41,
         is_path_partial: false,
-        allow_mining: false,
-        allow_placing: false,
+        policy: policy_for(false),
     });
     let ecs = detach_app_world(&mut app);
     let client = Client::new(entity, ecs.clone());
@@ -448,8 +451,7 @@ fn obstruction_does_not_patch_an_old_leg_after_replacement_listener_consumption(
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 17,
         is_path_partial: false,
-        allow_mining: false,
-        allow_placing: false,
+        policy: policy_for(false),
     });
     let ecs = detach_app_world(&mut app);
     let client = Client::new(entity, ecs.clone());
@@ -490,8 +492,7 @@ fn force_retire_synchronously_invalidates_a_queued_client_goto() {
             last_reached_node: current,
             ticks_since_last_node_reached: 0,
             is_path_partial: false,
-            allow_mining: false,
-            allow_placing: false,
+            policy: policy_for(false),
         },
         ComputePath(AsyncComputeTaskPool::get().spawn(async { None })),
     ));
@@ -564,8 +565,7 @@ fn empty_current_path_is_removed_and_stops_walking() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
-                allow_mining: false,
-                allow_placing: false,
+                policy: policy_for(false),
             },
             WorldName::new("minecraft:overworld"),
             Inventory::default(),
@@ -578,8 +578,7 @@ fn empty_current_path_is_removed_and_stops_walking() {
         path: Some(VecDeque::new()),
         is_partial: true,
         successors_fn: moves::default_move,
-        allow_mining: false,
-        allow_placing: false,
+        policy: policy_for(false),
     });
 
     app.update();
@@ -608,8 +607,7 @@ fn empty_partial_result_with_retry_disabled_stops_after_the_current_movement() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
-                allow_mining: false,
-                allow_placing: false,
+                policy: policy_for(false),
             },
             WorldName::new("minecraft:overworld"),
             Inventory::default(),
@@ -622,8 +620,7 @@ fn empty_partial_result_with_retry_disabled_stops_after_the_current_movement() {
         path: Some(VecDeque::new()),
         is_partial: true,
         successors_fn: moves::default_move,
-        allow_mining: false,
-        allow_placing: false,
+        policy: policy_for(false),
     });
 
     app.update();
@@ -668,8 +665,7 @@ fn partial_recalculation_can_be_disabled_without_dropping_patch_opts() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
-                allow_mining: false,
-                allow_placing: false,
+                policy: policy_for(false),
             },
         ))
         .id();
@@ -707,8 +703,7 @@ fn an_empty_partial_segment_is_retired_when_recalculation_is_disabled() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
-                allow_mining: false,
-                allow_placing: false,
+                policy: policy_for(false),
             },
         ))
         .id();
@@ -746,8 +741,7 @@ fn an_empty_old_segment_does_not_clear_a_replacement_calculation() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
-                allow_mining: false,
-                allow_placing: false,
+                policy: policy_for(false),
             },
         ))
         .id();
@@ -786,8 +780,7 @@ fn an_empty_old_segment_does_not_retire_a_queued_replacement() {
                 last_reached_node: BlockPos::new(0, 64, 0),
                 ticks_since_last_node_reached: 0,
                 is_path_partial: true,
-                allow_mining: false,
-                allow_placing: false,
+                policy: policy_for(false),
             },
         ))
         .id();
@@ -815,8 +808,7 @@ fn timeout_patching_preserves_a_graceful_stop_sentinel() {
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 41,
         is_path_partial: true,
-        allow_mining: false,
-        allow_placing: false,
+        policy: policy_for(false),
     };
 
     let pending = graceful_stop_pending(&pathfinder, &executing);
@@ -851,8 +843,7 @@ fn an_empty_timeout_patch_completes_a_graceful_stop() {
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 41,
         is_path_partial: true,
-        allow_mining: false,
-        allow_placing: false,
+        policy: policy_for(false),
     };
     let pending = graceful_stop_pending(&pathfinder, &executing);
     executing.path.clear(); // the timeout patch found no safe replacement
@@ -878,8 +869,7 @@ fn an_empty_timeout_patch_does_not_reset_the_stall_deadline() {
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 41,
         is_path_partial: true,
-        allow_mining: false,
-        allow_placing: false,
+        policy: policy_for(false),
     };
 
     finish_timeout_patch(&mut executing, false, PatchOutcome::NoPath);
@@ -896,8 +886,7 @@ fn a_usable_timeout_patch_starts_a_new_movement_deadline() {
         last_reached_node: BlockPos::new(0, 64, 0),
         ticks_since_last_node_reached: 41,
         is_path_partial: true,
-        allow_mining: false,
-        allow_placing: false,
+        policy: policy_for(false),
     };
 
     finish_timeout_patch(&mut executing, false, PatchOutcome::Applied);
@@ -1016,8 +1005,7 @@ fn mining_permission_after_path_found(allow_mining: bool) -> bool {
         path: Some(one_edge_path()),
         is_partial: false,
         successors_fn: moves::default_move,
-        allow_mining,
-        allow_placing: false,
+        policy: policy_for(allow_mining),
     });
 
     app.update();
@@ -1025,7 +1013,8 @@ fn mining_permission_after_path_found(allow_mining: bool) -> bool {
     app.world()
         .get::<ExecutingPath>(entity)
         .expect("a non-empty path must start executing")
-        .allow_mining
+        .policy
+        .may_break()
 }
 
 /// The executor must never be more permissive than the plan that produced the

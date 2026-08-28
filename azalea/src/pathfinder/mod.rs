@@ -25,6 +25,7 @@ mod lifecycle_tests;
 pub mod mining;
 pub mod moves;
 pub mod placing;
+pub mod policy;
 pub mod positions;
 pub mod simulation;
 #[cfg(test)]
@@ -143,19 +144,13 @@ pub struct ExecutingPath {
     // and our ticks take a while
     pub ticks_since_last_node_reached: usize,
     pub is_path_partial: bool,
-    /// Whether the plan that produced this path was allowed to mine.
+    /// 这条路线被批准做哪些世界替换（挖=换成空气，放=换成方块）。
     ///
-    /// The executor must not be more permissive than the planner: a path
-    /// computed with mining forbidden may still walk into a block the planner
-    /// believed was air, and breaking it would be an action the caller never
-    /// authorized. Carried per-path rather than read from [`Pathfinder::opts`]
-    /// because the opts are cleared on retirement while the path is still
-    /// executing.
-    pub allow_mining: bool,
-    /// Whether the plan that produced this path was allowed to place.
-    /// Same reasoning as [`Self::allow_mining`]: the executor must never be
-    /// more permissive than the planner was.
-    pub allow_placing: bool,
+    /// 执行器绝不能比规划它的那一版更宽松：一条禁止挖掘时算出来的路，执行时仍
+    /// 可能走进一个规划时以为是空气的方块，把它挖掉就是调用方从没授权过的动作。
+    /// 按路线携带而不是现读 [`Pathfinder::opts`]，因为 opts 在退休时会被清掉而
+    /// 路线还在跑；也因为模型随时可能改规则，而这条路线该按当时那一份走完。
+    pub policy: policy::PolicySnapshot,
 }
 impl ExecutingPath {
     pub fn is_empty_queued_path(&self) -> bool {
@@ -175,8 +170,7 @@ pub struct PathFoundEvent {
     pub path: Option<VecDeque<astar::Edge<BlockPos, moves::MoveData>>>,
     pub is_partial: bool,
     pub successors_fn: SuccessorsFn,
-    pub allow_mining: bool,
-    pub allow_placing: bool,
+    pub policy: policy::PolicySnapshot,
 }
 
 #[allow(clippy::type_complexity)]
@@ -366,6 +360,7 @@ pub fn goto_listener(
         Option<&Inventory>,
         Option<&CustomPathfinderState>,
         Option<&world::PathfinderBlockSource>,
+        Option<&policy::PathfinderReplacePolicy>,
     )>,
     worlds: Res<Worlds>,
 ) {
@@ -381,6 +376,7 @@ pub fn goto_listener(
             inventory,
             custom_state,
             block_source,
+            replace_policy,
         )) = query.get_mut(event.entity)
         else {
             warn!("got goto event for an entity that can't pathfind");
@@ -388,6 +384,12 @@ pub fn goto_listener(
         };
         // 借用不能逃进下面的 async move，先取成自有 Arc。
         let block_source = block_source.map(|source| source.0.clone());
+        // 这次规划就冻结在这一份上：之后模型怎么改规则，这条路线都按它走完。
+        let policy = policy::PolicySnapshot::new(
+            replace_policy.map(|installed| installed.0.clone()),
+            event.opts.allow_mining,
+            event.opts.allow_placing,
+        );
 
         // this env variable is set from the build.rs
         if env!("OPT_LEVEL") == "0" {
@@ -523,6 +525,7 @@ pub fn goto_listener(
                     placement_cache: PlacementCache::new(placing_menu.clone()),
                     custom_state: custom_state.clone(),
                     block_source: block_source.clone(),
+                    policy: policy.clone(),
                     opts: PathfinderOpts {
                         min_timeout: PathfinderTimeout::Nodes(2_000),
                         max_timeout: PathfinderTimeout::Nodes(2_000),
@@ -598,6 +601,7 @@ pub fn goto_listener(
                     goto_id_atomic,
                     mining_cache,
                     placement_cache,
+                    policy,
                     custom_state,
                     block_source,
                     opts,
@@ -644,6 +648,8 @@ pub struct CalculatePathCtx {
     pub goto_id_atomic: Arc<AtomicUsize>,
     pub mining_cache: MiningCache,
     pub placement_cache: PlacementCache,
+    /// 这次规划受哪一份替换策略约束。
+    pub policy: policy::PolicySnapshot,
     pub custom_state: CustomPathfinderState,
     /// `None` plans over the loaded world; `Some` plans over that source only.
     pub block_source: Option<Arc<dyn world::BlockSource>>,
@@ -674,7 +680,8 @@ fn calculate_path_at_generation(
     let cached_world = match ctx.block_source {
         Some(source) => CachedWorld::new(ctx.world_lock, origin).with_block_source(source),
         None => CachedWorld::new(ctx.world_lock, origin),
-    };
+    }
+    .with_replace_policy(ctx.policy.clone());
     let successors = |pos: RelBlockPos| {
         call_successors_fn(
             &cached_world,
@@ -767,8 +774,7 @@ fn calculate_path_at_generation(
         path: Some(mapped_path),
         is_partial,
         successors_fn: ctx.opts.successors_fn,
-        allow_mining: ctx.opts.allow_mining,
-        allow_placing: ctx.opts.allow_placing,
+        policy: ctx.policy,
     })
 }
 
@@ -875,13 +881,14 @@ pub fn path_found_listener(
                             CachedWorld::new(world_lock, origin).with_block_source(source.0.clone())
                         }
                         None => CachedWorld::new(world_lock, origin),
-                    };
-                    let mining_cache = MiningCache::new(if event.allow_mining {
+                    }
+                    .with_replace_policy(event.policy.clone());
+                    let mining_cache = MiningCache::new(if event.policy.may_break() {
                         Some(inventory.inventory_menu.clone())
                     } else {
                         None
                     });
-                    let placement_cache = PlacementCache::new(if event.allow_placing {
+                    let placement_cache = PlacementCache::new(if event.policy.may_place() {
                         Some(inventory.inventory_menu.clone())
                     } else {
                         None
@@ -932,8 +939,7 @@ pub fn path_found_listener(
                 );
                 executing_path.queued_path = Some(new_path);
                 executing_path.is_path_partial = event.is_partial;
-                executing_path.allow_mining = event.allow_mining;
-                executing_path.allow_placing = event.allow_placing;
+                executing_path.policy = event.policy.clone();
             } else {
                 commands.entity(event.entity).insert(ExecutingPath {
                     path: found_path.to_owned(),
@@ -941,8 +947,7 @@ pub fn path_found_listener(
                     last_reached_node: event.start,
                     ticks_since_last_node_reached: 0,
                     is_path_partial: event.is_partial,
-                    allow_mining: event.allow_mining,
-                    allow_placing: event.allow_placing,
+                    policy: event.policy.clone(),
                 });
                 debug!(
                     "set path to {:?}",

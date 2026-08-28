@@ -76,13 +76,16 @@ pub fn check_for_path_obstruction(
                 CachedWorld::new(world_lock, origin).with_block_source(source.clone())
             }
             None => CachedWorld::new(world_lock, origin),
-        };
-        let mining_cache = MiningCache::new(if opts.allow_mining {
+        }
+        // 阻塞判定要和这条路线当初被批准的口径一致：路线按那一份策略算出来，
+        // 「还走不走得通」也得按那一份问，否则会因为规则变了误判成受阻。
+        .with_replace_policy(executing_path.policy.clone());
+        let mining_cache = MiningCache::new(if executing_path.policy.may_break() {
             Some(inventory.inventory_menu.clone())
         } else {
             None
         });
-        let placement_cache = PlacementCache::new(if opts.allow_placing {
+        let placement_cache = PlacementCache::new(if executing_path.policy.may_place() {
             Some(inventory.inventory_menu.clone())
         } else {
             None
@@ -189,14 +192,12 @@ pub fn patch_path(
     let goal = Arc::new(BlockPosGoal(patch_end));
 
     let goto_id_atomic = pathfinder.goto_id.clone();
-    let allow_mining = opts.allow_mining;
-
-    let mining_cache = MiningCache::new(if allow_mining {
+    let mining_cache = MiningCache::new(if executing_path.policy.may_break() {
         Some(inventory.inventory_menu.clone())
     } else {
         None
     });
-    let placement_cache = PlacementCache::new(if opts.allow_placing {
+    let placement_cache = PlacementCache::new(if executing_path.policy.may_place() {
         Some(inventory.inventory_menu.clone())
     } else {
         None
@@ -211,6 +212,9 @@ pub fn patch_path(
         goto_id_atomic,
         mining_cache,
         placement_cache,
+        // 补出来的一段要接进这条路线里，所以按**这条路线**当时那一份策略批，
+        // 不能现取一份新的——否则两段是按不同规则批准的。
+        policy: executing_path.policy.clone(),
         custom_state,
         block_source,
         opts: PathfinderOpts {

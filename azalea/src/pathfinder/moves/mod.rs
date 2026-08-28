@@ -26,7 +26,8 @@ use super::{
     astar,
     custom_state::CustomPathfinderStateRef,
     mining::MiningCache,
-    placing::{PlacementCache, placeable_in_hotbar},
+    placing::{PlacementCache, placeable_candidates},
+    policy::PolicySnapshot,
     positions::RelBlockPos,
     world::{CachedWorld, is_block_state_passable},
 };
@@ -248,8 +249,9 @@ pub struct ExecuteCtx<'s, 'w1, 'w2, 'w3, 'w4, 'w5, 'w6, 'a> {
     pub position: Vec3,
     pub physics: &'a azalea_entity::Physics,
     pub is_currently_mining: bool,
-    pub can_mine: bool,
-    pub can_place: bool,
+    /// 这条路线被批准做哪些世界替换。规划时冻结，执行期只读——执行器不能比
+    /// 当时规划它的那一版更宽松。
+    pub policy: PolicySnapshot,
     pub side_effects: MovementSideEffects,
     pub world: Arc<RwLock<World>>,
     pub menu: Menu,
@@ -331,20 +333,23 @@ impl ExecuteCtx<'_, '_, '_, '_, '_, '_, '_, '_> {
             return false;
         }
         let block_state = self.world.read().get_block_state(block).unwrap_or_default();
-        should_mine_block_state(block_state)
+        should_mine_block_state(block_state) && self.policy.allows_break(block, block_state)
     }
 
     /// Mine the block at the given position.
     ///
     /// Returns whether the block is being mined.
     pub fn mine(&mut self, block: BlockPos) -> bool {
-        if !self.can_mine || !self.side_effects.allows_break(self.start, block) {
+        if !self.side_effects.allows_break(self.start, block) {
             return false;
         }
 
         let block_state = self.world.read().get_block_state(block).unwrap_or_default();
         if is_block_state_passable(block_state) {
             // block is already passable, no need to mine it
+            return false;
+        }
+        if !self.policy.allows_break(block, block_state) {
             return false;
         }
 
@@ -376,10 +381,11 @@ impl ExecuteCtx<'_, '_, '_, '_, '_, '_, '_, '_> {
     /// 挖的对称面（见 [`ReplaceTarget`]）：同样只碰规划时声明过的坐标，同样先把
     /// 手上换成合适的东西再动手。区别只在于换成的是方块而不是空气。
     pub fn place(&mut self, block: BlockPos) -> bool {
-        if !self.can_place || !self.side_effects.allows_place(self.start, block) {
+        if !self.side_effects.allows_place(self.start, block) {
             return false;
         }
-        if !is_block_state_passable(self.get_block_state(block)) {
+        let from = self.get_block_state(block);
+        if !is_block_state_passable(from) {
             // 已经有东西了，不用放——和 mine 碰上已经是空气一样，这不是失败。
             return false;
         }
@@ -391,7 +397,11 @@ impl ExecuteCtx<'_, '_, '_, '_, '_, '_, '_, '_> {
             return false;
         }
 
-        let Some(slot) = placeable_in_hotbar(&self.menu) else {
+        // 放什么由策略决定：手上的候选逐个去问，谁过谁上。
+        let Some((slot, _)) = placeable_candidates(&self.menu)
+            .into_iter()
+            .find(|(_, kind)| self.policy.allows_place(block, from, *kind))
+        else {
             return false;
         };
         self.commands.trigger(SetSelectedHotbarSlotEvent {

@@ -21,7 +21,7 @@ use azalea_world::{World, palette::PalettedContainer};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
-use super::{mining::MiningCache, positions::RelBlockPos};
+use super::{mining::MiningCache, policy::PolicySnapshot, positions::RelBlockPos};
 use crate::pathfinder::positions::SmallChunkSectionPos;
 
 const MAX_VIEW_DISTANCE: usize = 32;
@@ -74,6 +74,12 @@ pub struct CachedWorld {
 
     /// Installed by [`CachedWorld::with_block_source`]; `None` reads the world.
     block_source: Option<Arc<dyn BlockSource>>,
+
+    /// 这次规划允许寻路器自作主张改动世界到什么程度。默认全开。
+    ///
+    /// 挂在世界上而不是逐个调用点传，理由和 `block_source` 一样：破拆代价按位置
+    /// 缓存在这份世界里，策略必须和那份缓存同寿命，否则缓存会跨策略复用。
+    replace_policy: PolicySnapshot,
 }
 
 // we store `PalettedContainer`s instead of `Chunk`s or `Section`s because it
@@ -176,6 +182,7 @@ impl CachedWorld {
             cached_blocks: Default::default(),
             cached_mining_costs: UnsafeCell::new(None),
             block_source: None,
+            replace_policy: PolicySnapshot::open(),
         }
     }
 
@@ -186,6 +193,19 @@ impl CachedWorld {
     pub fn with_block_source(mut self, source: Arc<dyn BlockSource>) -> Self {
         self.block_source = Some(source);
         self
+    }
+
+    /// 这次规划受哪一份替换策略约束。不调用就是不受约束。
+    pub fn with_replace_policy(mut self, policy: PolicySnapshot) -> Self {
+        self.replace_policy = policy;
+        self
+    }
+
+    /// 这次规划的替换策略。放置那一侧（[`PlacementCache`]）也读它。
+    ///
+    /// [`PlacementCache`]: super::placing::PlacementCache
+    pub fn replace_policy(&self) -> &PolicySnapshot {
+        &self.replace_policy
     }
 
     // ```
@@ -356,6 +376,11 @@ impl CachedWorld {
         self.check_bitset_for_block(pos, |bitsets, index| bitsets.water.index(index))
     }
 
+    /// 把这次规划的相对坐标换成绝对坐标。策略按绝对坐标写规则。
+    pub fn absolute(&self, pos: RelBlockPos) -> BlockPos {
+        pos.apply(self.origin)
+    }
+
     /// Get the block state at the given position.
     ///
     /// This is relatively slow, so you should avoid it whenever possible.
@@ -454,6 +479,13 @@ impl CachedWorld {
             if is_block_state_passable(block_state) {
                 return 0.;
             }
+            // 真要动手才问策略：已经能通过的格子不构成一次替换。
+            if !self
+                .replace_policy
+                .allows_break(pos.apply(self.origin), block_state)
+            {
+                return f32::INFINITY;
+            }
             return self.uncached_cost_for_breaking_block_from_source(
                 pos,
                 mining_cache,
@@ -469,6 +501,13 @@ impl CachedWorld {
 
         let rel_pos = pos;
         let pos = pos.apply(self.origin);
+
+        if !self
+            .replace_policy
+            .allows_break(pos, self.get_block_state_at_pos(pos))
+        {
+            return f32::INFINITY;
+        }
 
         let (section_pos, section_block_pos) = (
             SmallChunkSectionPos::from(pos),
@@ -967,6 +1006,44 @@ mod tests {
             direct.get_block_state_at_pos(BlockPos::default()),
             BlockState::from(BlockKind::Fire),
             "direct state reads and section bitsets must share the fallback"
+        );
+    }
+
+    /// 策略拒绝的那一格，规划期就该是无穷代价——不能等到执行时才拦，否则 A* 会
+    /// 先规划出一条穿墙的路，再在执行时卡死在那面墙前面。
+    #[test]
+    fn a_denied_replacement_is_impossible_at_planning_time() {
+        struct NoBreaking;
+        impl crate::pathfinder::policy::ReplacePolicy for NoBreaking {
+            fn allows_replace(
+                &self,
+                _: BlockPos,
+                _: BlockState,
+                to: crate::pathfinder::policy::ReplaceTo,
+            ) -> bool {
+                !matches!(to, crate::pathfinder::policy::ReplaceTo::Air)
+            }
+        }
+
+        let target = BlockPos::new(0, 1, 0);
+        let rel_target = RelBlockPos::from_origin(BlockPos::default(), target);
+        let mining_cache = mining_cache_with_empty_inventory();
+
+        let (world, _owner) = world_with_block(target, BlockKind::Stone.into());
+        let unconstrained = CachedWorld::new(world.clone(), BlockPos::default());
+        assert!(
+            unconstrained
+                .cost_for_breaking_block(rel_target, &mining_cache)
+                .is_finite(),
+            "前提：不受约束时这块石头挖得动"
+        );
+
+        let denied = CachedWorld::new(world, BlockPos::default())
+            .with_replace_policy(PolicySnapshot::new(Some(Arc::new(NoBreaking)), true, true));
+        assert_eq!(
+            denied.cost_for_breaking_block(rel_target, &mining_cache),
+            f32::INFINITY,
+            "策略拒绝换成空气，这一格就不该进可执行图"
         );
     }
 

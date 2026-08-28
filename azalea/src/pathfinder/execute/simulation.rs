@@ -28,6 +28,7 @@ use crate::{
         ExecutingPath, PathfinderSystems,
         debug::debug_render_path_with_particles,
         moves::{ExecuteCtx, IsReachedCtx},
+        policy::PolicySnapshot,
         simulation::{SimulatedPlayerBundle, Simulation},
     },
 };
@@ -186,8 +187,7 @@ pub fn tick_execute_path(
                         start: executing_path.last_reached_node,
                         physics,
                         is_currently_mining: mining.is_some(),
-                        can_mine: executing_path.allow_mining,
-                        can_place: executing_path.allow_placing,
+                        policy: executing_path.policy.clone(),
                         side_effects: edge.movement.data.side_effects,
                         world: world_holder.shared.clone(),
                         menu: inventory.inventory_menu.clone(),
@@ -477,8 +477,7 @@ fn run_one_simulation(
                     physics,
                     is_currently_mining: mining.is_some(),
                     // don't modify the world from the simulation
-                    can_mine: false,
-                    can_place: false,
+                    policy: PolicySnapshot::default(),
                     side_effects: next_node.movement.data.side_effects,
                     world: sim.world.clone(),
                     menu: inventory.inventory_menu.clone(),

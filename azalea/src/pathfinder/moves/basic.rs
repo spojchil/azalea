@@ -737,6 +737,40 @@ mod tests {
         );
     }
 
+    /// 策略不许放这种方块，就不该生出垫柱边——手上有料不等于准放。
+    #[test]
+    fn a_policy_that_forbids_the_block_forbids_the_pillar() {
+        use crate::pathfinder::policy::{PolicySnapshot, ReplacePolicy, ReplaceTo};
+
+        struct NoCobblestone;
+        impl ReplacePolicy for NoCobblestone {
+            fn allows_replace(&self, _: BlockPos, _: BlockState, to: ReplaceTo) -> bool {
+                to != ReplaceTo::Block(BlockKind::Cobblestone)
+            }
+        }
+
+        let origin = BlockPos::new(0, 1, 0);
+        let (world, _owner) = world_with_floor(origin);
+        let cached_world = CachedWorld::new(world, origin).with_replace_policy(
+            PolicySnapshot::new(Some(Arc::new(NoCobblestone)), true, true),
+        );
+        let mining_cache = MiningCache::new(Some(Menu::Player(Player::default())));
+        let placement = PlacementCache::new(Some(hotbar_holding(ItemKind::Cobblestone)));
+        let custom_state = CustomPathfinderState::default();
+        let custom_state_ref = custom_state.0.read();
+
+        let mut edges = Vec::new();
+        let mut ctx = MovesCtx {
+            edges: &mut edges,
+            world: &cached_world,
+            mining_cache: &mining_cache,
+            placement: &placement,
+            custom_state: &custom_state_ref,
+        };
+        pillar_move(&mut ctx, RelBlockPos::get_origin(origin));
+        assert!(edges.is_empty(), "手上只有圆石而策略不许放圆石");
+    }
+
     /// 脚下悬空时贴不住，不该生出垫柱边。
     #[test]
     fn a_pillar_needs_something_to_place_against() {
