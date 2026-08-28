@@ -737,6 +737,69 @@ mod tests {
         );
     }
 
+    /// 严格迷雾下挖不下去：石头内部永远看不见，而往下挖要求落脚点已知是实心。
+    ///
+    /// 这不是缺实现，是判据本身排除的——`is_block_solid` 对未见格答否（未知哨兵
+    /// 的碰撞体不满）。开了挖掘也改变不了：一格挖开只能看见新暴露的那一面，再下
+    /// 一格仍在石头里。要让同伴能自己下悬崖，
+    /// 得先裁定「未见的地下算不算可落脚」，
+    /// 那是 P04 的事，不是这一层能补的。
+    #[test]
+    fn strict_fog_forbids_digging_downwards_however_much_mining_is_allowed() {
+        use crate::pathfinder::world::BlockSource;
+
+        /// 只认脚下那一格，再往下一律未知——就是站在石头上往下看的样子。
+        struct OnlyTheFloorIsKnown {
+            floor: BlockPos,
+        }
+        impl BlockSource for OnlyTheFloorIsKnown {
+            fn get_block_state(&self, pos: BlockPos) -> Option<BlockState> {
+                if pos == self.floor {
+                    Some(BlockKind::Stone.into())
+                } else if pos.y > self.floor.y {
+                    Some(BlockState::AIR)
+                } else {
+                    None
+                }
+            }
+            fn missing_block_state(&self) -> BlockState {
+                BlockKind::Fire.into()
+            }
+        }
+
+        let origin = BlockPos::new(0, 179, 0);
+        let world: Arc<RwLock<World>> = Arc::new(RwLock::new(ChunkStorage::default().into()));
+        let cached_world =
+            CachedWorld::new(world, origin).with_block_source(Arc::new(OnlyTheFloorIsKnown {
+                floor: origin.down(1),
+            }));
+
+        assert!(
+            cached_world.is_block_solid(RelBlockPos::get_origin(origin).down(1)),
+            "前提：脚下那一格是看得见的实心"
+        );
+        assert!(
+            !cached_world.is_block_solid(RelBlockPos::get_origin(origin).down(2)),
+            "再往下一格未见，就不算实心"
+        );
+
+        let mining_cache = MiningCache::new(Some(Menu::Player(Player::default())));
+        let placement = PlacementCache::new(Some(hotbar_holding(ItemKind::Cobblestone)));
+        let custom_state = CustomPathfinderState::default();
+        let custom_state_ref = custom_state.0.read();
+
+        let mut edges = Vec::new();
+        let mut ctx = MovesCtx {
+            edges: &mut edges,
+            world: &cached_world,
+            mining_cache: &mining_cache,
+            placement: &placement,
+            custom_state: &custom_state_ref,
+        };
+        downward_move(&mut ctx, RelBlockPos::get_origin(origin));
+        assert!(edges.is_empty(), "挖不下去：落脚点未知");
+    }
+
     /// 策略不许放这种方块，就不该生出垫柱边——手上有料不等于准放。
     #[test]
     fn a_policy_that_forbids_the_block_forbids_the_pillar() {
