@@ -22,12 +22,7 @@ use crate::{
 /// # use bevy_ecs::message::MessageReader;
 ///
 /// fn handle_packets(mut events: MessageReader<ReceiveGamePacketEvent>) {
-///     for ReceiveGamePacketEvent {
-///         entity,
-///         packet,
-///         ..
-///     } in events.read()
-///     {
+///     for ReceiveGamePacketEvent { entity, packet, .. } in events.read() {
 ///         match packet.as_ref() {
 ///             ClientboundGamePacket::LevelParticles(p) => {
 ///                 // ...

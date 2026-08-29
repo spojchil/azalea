@@ -357,7 +357,6 @@ pub fn poll_create_connection_task(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::{
         sync::atomic::AtomicBool,
         time::{Duration, Instant},
@@ -365,6 +364,8 @@ mod tests {
 
     use azalea_protocol::address::{ResolvedAddr, ServerAddr};
     use bevy_ecs::message::Messages;
+
+    use super::*;
 
     fn test_app() -> App {
         let mut app = App::new();

@@ -10,8 +10,7 @@ use bevy_ecs::prelude::*;
 use derive_more::Deref;
 use tracing::info;
 
-use super::join::AttemptToken;
-use super::login::IsAuthenticated;
+use super::{join::AttemptToken, login::IsAuthenticated};
 #[cfg(feature = "online-mode")]
 use crate::chat_signing;
 use crate::{

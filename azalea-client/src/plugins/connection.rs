@@ -32,8 +32,10 @@ use tracing::{debug, error, info, trace};
 use super::packet::{
     config::ReceiveConfigPacketEvent, game::ReceiveGamePacketEvent, login::ReceiveLoginPacketEvent,
 };
-use crate::join::AttemptToken;
-use crate::packet::{config, game, login};
+use crate::{
+    join::AttemptToken,
+    packet::{config, game, login},
+};
 
 pub struct ConnectionPlugin;
 impl Plugin for ConnectionPlugin {
@@ -421,10 +423,11 @@ async fn write_task(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::local_player::Hunger;
     use azalea_entity::metadata::Health;
     use azalea_protocol::write::serialize_packet;
+
+    use super::*;
+    use crate::local_player::Hunger;
 
     fn set_health_bytes(health: f32) -> Box<[u8]> {
         serialize_packet(

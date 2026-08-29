@@ -4,6 +4,7 @@ mod attempt_identity;
 mod change_dimension_to_nether_and_back;
 mod client_disconnect;
 mod close_open_container;
+mod confirmed_self_block_updates;
 mod correct_movement;
 mod correct_sneak_movement;
 mod correct_sprint_sneak_movement;

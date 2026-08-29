@@ -31,7 +31,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     ClientInformation,
-    block_update::QueuedServerBlockUpdates,
+    block_update::{ConfirmedSelfBlockUpdates, QueuedServerBlockUpdates},
     chat::{ChatPacket, ChatReceivedEvent},
     chunks,
     connection::RawConnection,
@@ -1122,14 +1122,40 @@ impl GamePacketHandler<'_> {
     pub fn award_stats(&mut self, _p: &ClientboundAwardStats) {}
 
     pub fn block_changed_ack(&mut self, p: &ClientboundBlockChangedAck) {
-        as_system::<Query<(&WorldHolder, &mut BlockStatePredictionHandler)>>(
-            self.ecs,
-            |mut query| {
-                let (local_player, mut prediction_handler) = query.get_mut(self.player).unwrap();
-                let world = local_player.shared.read();
-                prediction_handler.end_prediction_up_to(p.seq, &world);
-            },
-        );
+        as_system::<
+            Query<(
+                &WorldHolder,
+                &mut BlockStatePredictionHandler,
+                &QueuedServerBlockUpdates,
+                Option<&mut ConfirmedSelfBlockUpdates>,
+            )>,
+        >(self.ecs, |mut query| {
+            let (local_player, mut prediction_handler, queued, mut confirmed_self) =
+                query.get_mut(self.player).unwrap();
+
+            // Block updates are queued in `PreUpdate` but only drained in
+            // `Update` (`handle_block_update_event`), while this ack is handled
+            // inline. A server that answers an action with `BlockUpdate` +
+            // `BlockChangedAck` in the same batch — the normal case, measured
+            // 2ms apart on the wire — would therefore have its prediction
+            // settled and dropped here *before* the update is ever matched
+            // against it, so the update always looked passive and
+            // `ConfirmedSelfBlockUpdates` stayed empty.
+            //
+            // So match the already-received updates against pending
+            // predictions first. The queue itself is left alone: draining and
+            // writing the world stays in `Update`, after chunks are handled.
+            for (pos, block_state) in &queued.list {
+                if prediction_handler.update_known_server_state(*pos, *block_state) {
+                    if let Some(ref mut confirmed_self) = confirmed_self {
+                        confirmed_self.list.push((*pos, *block_state));
+                    }
+                }
+            }
+
+            let world = local_player.shared.read();
+            prediction_handler.end_prediction_up_to(p.seq, &world);
+        });
     }
 
     pub fn block_destruction(&mut self, _p: &ClientboundBlockDestruction) {}
