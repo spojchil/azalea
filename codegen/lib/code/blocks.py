@@ -37,7 +37,10 @@ def generate_blocks(
         block_data_report = blocks_report[f"minecraft:{block_id}"]
 
         block_properties = {}
-        for property_id in list(block_data_report.get("properties", {}).keys()):
+        # Vanilla numbers states over its properties sorted by name (StateDefinition keeps
+        # them in an ImmutableSortedMap); the report lists them in declaration order,
+        # which differs for e.g. chest (type, facing, waterlogged).
+        for property_id in sorted(block_data_report.get("properties", {}).keys()):
             property_variants = block_data_report["properties"][property_id]
 
             property_struct_name = get_property_struct_name(
@@ -98,7 +101,10 @@ def generate_blocks(
                 default_property_variants = state.get("properties", {})
 
         properties_code = "{"
-        for property_id in list(block_data_report.get("properties", {}).keys()):
+        # Vanilla numbers states over its properties sorted by name (StateDefinition keeps
+        # them in an ImmutableSortedMap); the report lists them in declaration order,
+        # which differs for e.g. chest (type, facing, waterlogged).
+        for property_id in sorted(block_data_report.get("properties", {}).keys()):
             property_default = default_property_variants.get(property_id)
             property_variants = block_data_report["properties"][property_id]
 

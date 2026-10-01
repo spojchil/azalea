@@ -102,6 +102,38 @@ mod tests {
         assert_eq!(block, block_from_state);
     }
 
+    /// State ids follow vanilla's name-sorted property order. Chest is declared as
+    /// (type, facing, waterlogged) in the data report but numbered as
+    /// (facing, type, waterlogged); ids taken from the 26.1.2 `blocks.json` report.
+    #[test]
+    pub fn chest_and_piston_head_state_ids_match_vanilla() {
+        let decode = |id: u32| {
+            let state = crate::BlockState::try_from(id).unwrap();
+            let block = Box::<dyn BlockTrait>::from(state);
+            let mut map: Vec<_> = block.property_map().into_iter().collect();
+            map.sort();
+            (block.id(), map)
+        };
+        assert_eq!(
+            decode(3989),
+            (
+                "chest",
+                vec![("facing", "north"), ("type", "left"), ("waterlogged", "true")]
+            )
+        );
+        assert_eq!(
+            decode(2270),
+            (
+                "piston_head",
+                vec![("facing", "north"), ("short", "true"), ("type", "sticky")]
+            )
+        );
+        assert_eq!(
+            decode(2311),
+            ("moving_piston", vec![("facing", "east"), ("type", "normal")])
+        );
+    }
+
     #[test]
     pub fn test_property_map() {
         let block = crate::blocks::OakTrapdoor {
