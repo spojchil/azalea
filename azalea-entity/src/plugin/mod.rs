@@ -66,7 +66,14 @@ impl Plugin for EntityPlugin {
                 ),
             ),
         )
-        .add_systems(GameTick, (update_in_loaded_chunk, update_fluid_on_eyes))
+        .add_systems(
+            GameTick,
+            (
+                update_in_loaded_chunk,
+                update_fluid_on_eyes,
+                tick_local_death,
+            ),
+        )
         .add_observer(handle_add_effect)
         .add_observer(handle_remove_effects)
         .init_resource::<EntityUuidIndex>();
@@ -93,6 +100,34 @@ pub fn add_dead(mut commands: Commands, query: Query<(Entity, &Health), Changed<
     for (entity, health) in query.iter() {
         if **health <= 0.0 {
             commands.entity(entity).insert(Dead);
+        }
+    }
+}
+
+/// Count [`DeathTime`] for dead local entities, and mark them
+/// [`RemovedAfterDeath`] once it reaches 20 like vanilla's
+/// `LocalPlayer.tickDeath`.
+#[allow(clippy::type_complexity)]
+pub fn tick_local_death(
+    mut commands: Commands,
+    mut query: Query<
+        (Entity, Option<&mut DeathTime>),
+        (With<Dead>, With<LocalEntity>, Without<RemovedAfterDeath>),
+    >,
+) {
+    for (entity, death_time) in &mut query {
+        let ticks = match death_time {
+            Some(mut death_time) => {
+                death_time.0 += 1;
+                death_time.0
+            }
+            None => {
+                commands.entity(entity).insert(DeathTime(1));
+                1
+            }
+        };
+        if ticks >= 20 {
+            commands.entity(entity).insert(RemovedAfterDeath);
         }
     }
 }

@@ -17,8 +17,8 @@ use azalea_core::{
 };
 use azalea_entity::{
     ActiveEffects, Attributes, EntityKindComponent, HasClientLoaded, Jumping, LocalEntity,
-    LookDirection, OnClimbable, Physics, Pose, Position, dimensions::EntityDimensions,
-    metadata::Sprinting, move_relative,
+    LookDirection, OnClimbable, Physics, Pose, Position, RemovedAfterDeath,
+    dimensions::EntityDimensions, metadata::Sprinting, move_relative,
 };
 use azalea_registry::builtin::{BlockKind, EntityKind, MobEffect};
 use azalea_world::{World, WorldName, Worlds};
@@ -74,7 +74,11 @@ pub fn ai_step(
             &WorldName,
             &EntityKindComponent,
         ),
-        (With<LocalEntity>, With<HasClientLoaded>),
+        (
+            With<LocalEntity>,
+            With<HasClientLoaded>,
+            Without<RemovedAfterDeath>,
+        ),
     >,
     worlds: Res<Worlds>,
 ) {
@@ -177,7 +181,11 @@ fn jump_in_liquid(physics: &mut Physics) {
 pub fn apply_effects_from_blocks(
     mut query: Query<
         (&mut Physics, &Position, &EntityDimensions, &WorldName),
-        (With<LocalEntity>, With<HasClientLoaded>),
+        (
+            With<LocalEntity>,
+            With<HasClientLoaded>,
+            Without<RemovedAfterDeath>,
+        ),
     >,
     worlds: Res<Worlds>,
 ) {

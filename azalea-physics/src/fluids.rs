@@ -6,7 +6,7 @@ use azalea_core::{
     direction::Direction,
     position::{BlockPos, Vec3},
 };
-use azalea_entity::{HasClientLoaded, LocalEntity, Physics, Position};
+use azalea_entity::{HasClientLoaded, LocalEntity, Physics, Position, RemovedAfterDeath};
 use azalea_registry::builtin::BlockKind;
 use azalea_world::{World, WorldName, Worlds};
 use bevy_ecs::prelude::*;
@@ -17,7 +17,11 @@ use crate::collision::legacy_blocks_motion;
 pub fn update_in_water_state_and_do_fluid_pushing(
     mut query: Query<
         (&mut Physics, &Position, &WorldName),
-        (With<LocalEntity>, With<HasClientLoaded>),
+        (
+            With<LocalEntity>,
+            With<HasClientLoaded>,
+            Without<RemovedAfterDeath>,
+        ),
     >,
     worlds: Res<Worlds>,
 ) {

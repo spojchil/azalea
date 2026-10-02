@@ -9,8 +9,8 @@ use azalea_core::{
     position::{ChunkPos, Vec3},
 };
 use azalea_entity::{
-    Dead, EntityBundle, EntityKindComponent, HasClientLoaded, LoadedBy, LocalEntity, LookDirection,
-    Physics, PlayerAbilities, Position,
+    Dead, DeathTime, EntityBundle, EntityKindComponent, HasClientLoaded, LoadedBy, LocalEntity,
+    LookDirection, Physics, PlayerAbilities, Position, RemovedAfterDeath,
     effect_events::{AddEffectEvent, RemoveEffectsEvent},
     indexing::{EntityIdIndex, EntityUuidIndex},
     inventory::Inventory,
@@ -1469,7 +1469,7 @@ impl GamePacketHandler<'_> {
 
                 commands
                     .entity(self.player)
-                    .remove::<(Dead, HasClientLoaded)>();
+                    .remove::<(Dead, DeathTime, RemovedAfterDeath, HasClientLoaded)>();
             },
         )
     }

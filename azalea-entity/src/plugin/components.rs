@@ -67,6 +67,25 @@ impl EntityBundle {
 #[derive(Clone, Component, Copy, Default)]
 pub struct Dead;
 
+/// How many ticks a dead local entity has been dying for, like vanilla's
+/// `LivingEntity.deathTime`.
+///
+/// Only counted for [`LocalEntity`]s, see
+/// [`tick_local_death`](super::tick_local_death).
+#[derive(Clone, Component, Copy, Debug, Default)]
+pub struct DeathTime(pub u32);
+
+/// Marker for a dead local player that vanilla would have removed from the
+/// level.
+///
+/// Vanilla's `LocalPlayer.tickDeath` removes the player once its death time
+/// reaches 20, so it stops ticking until it respawns. The server removes its
+/// player at the same moment and forgets every chunk the player was tracking,
+/// so a client that kept simulating would fall through the missing terrain
+/// forever. Physics and movement packets skip entities with this component.
+#[derive(Clone, Component, Copy, Debug, Default)]
+pub struct RemovedAfterDeath;
+
 /// A component NewType for [`EntityKind`].
 ///
 /// Most of the time, you should be using `azalea_registry::EntityKind`

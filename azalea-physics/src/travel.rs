@@ -5,7 +5,7 @@ use azalea_core::{
 };
 use azalea_entity::{
     Attributes, HasClientLoaded, Jumping, LocalEntity, LookDirection, OnClimbable, Physics,
-    PlayerAbilities, Pose, Position, metadata::Sprinting, move_relative,
+    PlayerAbilities, Pose, Position, RemovedAfterDeath, metadata::Sprinting, move_relative,
 };
 use azalea_world::{World, WorldName, Worlds};
 use bevy_ecs::prelude::*;
@@ -40,7 +40,11 @@ pub fn travel(
             &mut LookDirection,
             &mut Position,
         ),
-        (With<LocalEntity>, With<HasClientLoaded>),
+        (
+            With<LocalEntity>,
+            With<HasClientLoaded>,
+            Without<RemovedAfterDeath>,
+        ),
     >,
     worlds: Res<Worlds>,
     aabb_query: AabbQuery,

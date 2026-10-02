@@ -10,7 +10,9 @@ use azalea_core::{
     registry_holder::RegistryHolder,
     tick::GameTick,
 };
-use azalea_entity::{EntityBundle, EntityPlugin, HasClientLoaded, LocalEntity, Physics, Position};
+use azalea_entity::{
+    Dead, EntityBundle, EntityPlugin, HasClientLoaded, LocalEntity, Physics, Position,
+};
 use azalea_physics::PhysicsPlugin;
 use azalea_registry::builtin::{BlockKind, EntityKind};
 use azalea_world::{Chunk, PartialWorld, World, WorldName, Worlds};
@@ -91,6 +93,54 @@ fn test_gravity() {
             entity_pos.y
         );
     }
+}
+/// Like vanilla's `LocalPlayer.tickDeath`, a dead local entity keeps falling
+/// for its first 20 ticks of death and then stops simulating, since the server
+/// forgets its chunks at that point.
+#[test]
+fn test_dead_local_entity_stops_after_death_time() {
+    let mut app = make_test_app();
+    let world_lock = insert_overworld(&mut app);
+    let mut partial_world = PartialWorld::default();
+    partial_world.chunks.set(
+        &ChunkPos { x: 0, z: 0 },
+        Some(Chunk::default()),
+        &mut world_lock.write().chunks,
+    );
+
+    let entity = app
+        .world_mut()
+        .spawn((
+            EntityBundle::new(
+                Uuid::nil(),
+                Vec3 {
+                    x: 0.,
+                    y: 70.,
+                    z: 0.,
+                },
+                EntityKind::Zombie,
+                WorldName::new("minecraft:overworld"),
+            ),
+            MinecraftEntityId(0),
+            LocalEntity,
+            HasClientLoaded,
+            Dead,
+        ))
+        .id();
+    app.update();
+    for _ in 0..20 {
+        app.world_mut().run_schedule(GameTick);
+        app.update();
+    }
+    let removed_at = app.world_mut().get::<Position>(entity).unwrap().y;
+    assert!(removed_at < 70., "should still fall while dying");
+
+    for _ in 0..20 {
+        app.world_mut().run_schedule(GameTick);
+        app.update();
+    }
+    let later = app.world_mut().get::<Position>(entity).unwrap().y;
+    assert_eq!(later, removed_at, "should stop simulating after 20 ticks");
 }
 #[test]
 fn test_collision() {

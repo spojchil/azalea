@@ -6,7 +6,7 @@ use azalea_core::{
 };
 use azalea_entity::{
     Attributes, Crouching, HasClientLoaded, Jumping, LastSentPosition, LocalEntity, LookDirection,
-    Physics, PlayerAbilities, Pose, Position,
+    Physics, PlayerAbilities, Pose, Position, RemovedAfterDeath,
     dimensions::calculate_dimensions,
     metadata::{self, Sprinting},
     update_bounding_box,
@@ -97,7 +97,7 @@ pub fn send_position(
             &mut Physics,
             &mut LastSentLookDirection,
         ),
-        With<HasClientLoaded>,
+        (With<HasClientLoaded>, Without<RemovedAfterDeath>),
     >,
     mut commands: Commands,
 ) {
@@ -307,7 +307,11 @@ pub fn local_player_ai_step(
             &mut Crouching,
             &mut Attributes,
         ),
-        (With<HasClientLoaded>, With<LocalEntity>),
+        (
+            With<HasClientLoaded>,
+            With<LocalEntity>,
+            Without<RemovedAfterDeath>,
+        ),
     >,
     aabb_query: AabbQuery,
     collidable_entity_query: CollidableEntityQuery,
