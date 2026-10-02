@@ -1,4 +1,5 @@
 pub mod pick;
+pub mod predict;
 
 use std::collections::HashMap;
 
@@ -12,13 +13,15 @@ use azalea_core::{
     tick::GameTick,
 };
 use azalea_entity::{
-    Attributes, LocalEntity, LookDirection, PlayerAbilities, Position,
+    Attributes, Dead, EntityKindComponent, LocalEntity, LookDirection, PlayerAbilities, Position,
     attributes::{
         creative_block_interaction_range_modifier, creative_entity_interaction_range_modifier,
     },
     clamp_look_direction,
+    dimensions::EntityDimensions,
     indexing::EntityIdIndex,
     inventory::Inventory,
+    metadata::FallFlying,
 };
 use azalea_inventory::{ItemStack, ItemStackData, components};
 use azalea_physics::{
@@ -29,7 +32,7 @@ use azalea_protocol::packets::game::{
     ServerboundInteract, ServerboundUseItem, s_interact::InteractionHand,
     s_swing::ServerboundSwing, s_use_item_on::ServerboundUseItemOn,
 };
-use azalea_world::World;
+use azalea_world::{World, WorldName, Worlds};
 use bevy_app::{App, Plugin, Update};
 use bevy_ecs::prelude::*;
 use tracing::warn;
@@ -39,7 +42,7 @@ use crate::{
     attack::handle_attack_event,
     interact::pick::{HitResultComponent, update_hit_result_component},
     inventory::InventorySystems,
-    local_player::{LocalGameMode, PermissionLevel},
+    local_player::{Hunger, LocalGameMode, PermissionLevel},
     movement::MoveEventsSystems,
     packet::game::SendGamePacketEvent,
     respawn::perform_respawn,
@@ -236,32 +239,78 @@ pub struct StartUseItemQueued {
     /// it, but should be avoided to stay compatible with anticheats.
     pub force_block: Option<BlockPos>,
 }
+/// Vanilla's `Minecraft.startUseItem`: try each hand in turn (from the queued
+/// hand onwards), first on the targeted entity or block and then by using the
+/// held item, and stop at the first step that succeeds (or, for a block, at a
+/// failure).
+///
+/// Every step sends its packet, like vanilla does; whether the next step runs
+/// is decided by [`predict`], which reproduces the client-side result vanilla
+/// computes before moving on.
 #[allow(clippy::type_complexity)]
 pub fn handle_start_use_item_queued(
     mut commands: Commands,
-    query: Query<(
+    mut query: Query<(
         Entity,
         &StartUseItemQueued,
         &mut BlockStatePredictionHandler,
         &HitResultComponent,
         &LookDirection,
         Option<&Mining>,
+        (
+            &LocalGameMode,
+            &PlayerAbilities,
+            &PermissionLevel,
+            &PhysicsState,
+            &Hunger,
+            &Inventory,
+            &Position,
+            &EntityDimensions,
+            &Attributes,
+            Option<&FallFlying>,
+            &WorldName,
+        ),
     )>,
+    worlds: Res<Worlds>,
+    targets: Query<(&EntityKindComponent, Has<Dead>)>,
 ) {
-    for (entity, start_use_item, mut prediction_handler, hit_result, look_direction, mining) in
-        query
+    for (
+        entity,
+        start_use_item,
+        mut prediction_handler,
+        hit_result,
+        look_direction,
+        mining,
+        (
+            game_mode,
+            abilities,
+            permission_level,
+            physics_state,
+            hunger,
+            inventory,
+            position,
+            dimensions,
+            attributes,
+            fall_flying,
+            world_name,
+        ),
+    ) in &mut query
     {
         commands.entity(entity).remove::<StartUseItemQueued>();
 
+        // `if (!this.gameMode.isDestroying())`
         if mining.is_some() {
-            warn!("Got a StartUseItemEvent for a client that was mining");
+            continue;
         }
+        let Some(world_lock) = worlds.get(world_name) else {
+            continue;
+        };
+        let world = world_lock.read();
 
-        // TODO: this also skips if LocalPlayer.handsBusy is true, which is used when
-        // rowing a boat
+        // TODO: vanilla also skips this while `LocalPlayer.handsBusy` (rowing a
+        // boat).
 
         let mut hit_result = (**hit_result).clone();
-
         if let Some(force_block) = start_use_item.force_block {
             let hit_result_matches = if let HitResult::Block(block_hit_result) = &hit_result {
                 block_hit_result.block_pos == force_block
@@ -282,40 +331,99 @@ pub fn handle_start_use_item_queued(
             }
         }
 
-        match &hit_result {
-            HitResult::Block(r) => {
-                let seq = prediction_handler.start_predicting();
-                if r.miss {
-                    commands.trigger(SendGamePacketEvent::new(
-                        entity,
-                        ServerboundUseItem {
-                            hand: start_use_item.hand,
-                            seq,
-                            x_rot: look_direction.x_rot(),
-                            y_rot: look_direction.y_rot(),
-                        },
-                    ));
-                } else {
+        let actor = predict::Actor {
+            game_mode: game_mode.current,
+            abilities,
+            permission_level: **permission_level,
+            sneaking: physics_state.trying_to_crouch,
+            food: hunger.food,
+            fall_flying: fall_flying.is_some_and(|f| **f),
+            inventory,
+            eye_position: position.up(dimensions.eye_height.into()),
+            look_direction: *look_direction,
+            block_interaction_range: attributes.block_interaction_range.calculate(),
+        };
+        let swing = |commands: &mut Commands, hand: InteractionHand| {
+            commands.trigger(SendGamePacketEvent::new(entity, ServerboundSwing { hand }));
+        };
+
+        let hands: &[InteractionHand] = match start_use_item.hand {
+            InteractionHand::MainHand => &[InteractionHand::MainHand, InteractionHand::OffHand],
+            InteractionHand::OffHand => &[InteractionHand::OffHand],
+        };
+        for &hand in hands {
+            match &hit_result {
+                HitResult::Entity(r) => {
+                    // the pick range already limits this to the entity
+                    // interaction range
+                    commands.trigger(EntityInteractEvent {
+                        client: entity,
+                        target: r.entity,
+                        location: Some(r.location),
+                        hand,
+                    });
+                    let target = targets
+                        .get(r.entity)
+                        .ok()
+                        .map(|(kind, dead)| predict::Target {
+                            kind: **kind,
+                            alive: !dead,
+                        });
+                    if let Some(target) = target {
+                        let result = predict::interact(&actor, hand, &target);
+                        if let predict::InteractionResult::Success(source) = result {
+                            if source == predict::Swing::Client {
+                                swing(&mut commands, hand);
+                            }
+                            break;
+                        }
+                    }
+                }
+                HitResult::Block(r) if !r.miss => {
+                    // TODO: vanilla fails here when the block is outside the
+                    // world border.
+                    let seq = prediction_handler.start_predicting();
                     commands.trigger(SendGamePacketEvent::new(
                         entity,
                         ServerboundUseItemOn {
-                            hand: start_use_item.hand,
+                            hand,
                             block_hit: r.into(),
                             seq,
                         },
                     ));
-                    // TODO: depending on the result of useItemOn, this might
-                    // also need to send a SwingArmEvent.
-                    // basically, this TODO is for simulating block
-                    // interactions/placements on the client-side.
+                    match predict::use_item_on(&world, &actor, hand, r) {
+                        predict::InteractionResult::Success(source) => {
+                            if source == predict::Swing::Client {
+                                swing(&mut commands, hand);
+                            }
+                            break;
+                        }
+                        predict::InteractionResult::Fail => break,
+                        _ => {}
+                    }
                 }
+                HitResult::Block(_) => {}
             }
-            HitResult::Entity(r) => {
-                commands.trigger(EntityInteractEvent {
-                    client: entity,
-                    target: r.entity,
-                    location: Some(r.location),
-                });
+
+            if !actor.item(hand).is_empty() {
+                let seq = prediction_handler.start_predicting();
+                commands.trigger(SendGamePacketEvent::new(
+                    entity,
+                    ServerboundUseItem {
+                        hand,
+                        seq,
+                        x_rot: look_direction.x_rot(),
+                        y_rot: look_direction.y_rot(),
+                    },
+                ));
+                if let predict::InteractionResult::Success(source) =
+                    predict::use_item(&world, &actor, hand)
+                {
+                    if source == predict::Swing::Client {
+                        swing(&mut commands, hand);
+                    }
+                    break;
+                }
             }
         }
     }
@@ -336,6 +444,8 @@ pub struct EntityInteractEvent {
     /// we're not looking at the entity, then it'll arbitrary send the target's
     /// exact position.
     pub location: Option<Vec3>,
+    /// The hand we're interacting with.
+    pub hand: InteractionHand,
 }
 
 pub fn handle_entity_interact(
@@ -378,22 +488,15 @@ pub fn handle_entity_interact(
         }
     };
 
+    // `MultiPlayerGameMode.interact` sends exactly one packet (the separate
+    // interact/interact-at pair is gone since the packet carries the location).
     let interact = ServerboundInteract {
         entity_id,
-        hand: InteractionHand::MainHand,
+        hand: trigger.hand,
         location: LpVec3::from(location),
         using_secondary_action: physics_state.trying_to_crouch,
     };
-    commands.trigger(SendGamePacketEvent::new(trigger.client, interact.clone()));
-
-    // TODO: this is true if the interaction failed, which i think can only happen
-    // in certain cases when interacting with armor stands
-    let consumes_action = false;
-    if !consumes_action {
-        // but yes, most of the time vanilla really does send two identical interact
-        // packets like this
-        commands.trigger(SendGamePacketEvent::new(trigger.client, interact));
-    }
+    commands.trigger(SendGamePacketEvent::new(trigger.client, interact));
 }
 
 /// Whether we can't interact with the block, based on your gamemode.
