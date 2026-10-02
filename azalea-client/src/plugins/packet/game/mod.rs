@@ -1252,8 +1252,16 @@ impl GamePacketHandler<'_> {
     pub fn forget_level_chunk(&mut self, p: &ClientboundForgetLevelChunk) {
         debug!("Got forget level chunk packet {p:?}");
 
-        as_system::<Query<&WorldHolder>>(self.ecs, |mut query| {
-            let local_player = query.get_mut(self.player).unwrap();
+        as_system::<Query<(&WorldHolder, Has<Dead>)>>(self.ecs, |mut query| {
+            let (local_player, dead) = query.get_mut(self.player).unwrap();
+
+            // The server stops tracking a dead player 20 ticks after death and
+            // forgets every chunk it had sent, but the vanilla death screen keeps
+            // showing the world as it was. Keep the chunks until respawn, which
+            // replaces the whole partial world anyway.
+            if dead {
+                return;
+            }
 
             let mut partial_world = local_player.partial.write();
 
