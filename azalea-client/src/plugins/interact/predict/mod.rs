@@ -269,9 +269,31 @@ pub fn use_item_on(
     hand: InteractionHand,
     hit: &BlockHitResult,
 ) -> InteractionResult {
+    use_item_on_placing(world, actor, hand, hit).0
+}
+
+/// A block that a successful right click is predicted to have placed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Placement {
+    pub pos: BlockPos,
+    pub block: BlockKind,
+}
+
+/// [`use_item_on`], plus where the held block item lands when the click is
+/// predicted to place it.
+///
+/// Approximation: like [`can_place`], the spot only has to be replaceable;
+/// vanilla also checks the placement state can survive there and that no
+/// entity is in the way, and the server has the final say.
+pub fn use_item_on_placing(
+    world: &World,
+    actor: &Actor,
+    hand: InteractionHand,
+    hit: &BlockHitResult,
+) -> (InteractionResult, Option<Placement>) {
     let item = actor.item(hand);
     if actor.game_mode == GameMode::Spectator {
-        return CONSUME;
+        return (CONSUME, None);
     }
     let have_something = !actor.item(InteractionHand::MainHand).is_empty()
         || !actor.item(InteractionHand::OffHand).is_empty();
@@ -280,22 +302,37 @@ pub fn use_item_on(
         let state = block_at(world, hit.block_pos);
         let item_use = block_use_item_on_result(world, actor, state, item, hand, hit);
         if item_use.consumes_action() {
-            return item_use;
+            return (item_use, None);
         }
         if item_use == TryWithEmptyHand && hand == InteractionHand::MainHand {
             let used = block_use_without_item_result(actor, state, hit);
             if used.consumes_action() {
-                return used;
+                return (used, None);
             }
         }
     }
     // Item cooldowns aren't tracked; vanilla returns PASS here while the item
     // is on cooldown.
-    if !item.is_empty() {
-        item_use_on_result(world, actor, hand, item, hit)
-    } else {
-        Pass
+    if item.is_empty() {
+        return (Pass, None);
     }
+    let result = item_use_on_result(world, actor, hand, item, hit);
+    let placement = match (result, item_use_on(kind(item))) {
+        (InteractionResult::Success(_), ItemUseOn::BlockItem) => item_places(kind(item))
+            .and_then(|block| placement_pos(world, hit).map(|pos| Placement { pos, block })),
+        _ => None,
+    };
+    (result, placement)
+}
+
+/// `BlockPlaceContext.getClickedPos`: the clicked block itself when it can be
+/// replaced, otherwise the one in front of the clicked face.
+fn placement_pos(world: &World, hit: &BlockHitResult) -> Option<BlockPos> {
+    if is_replaceable(BlockKind::from(block_at(world, hit.block_pos))) {
+        return Some(hit.block_pos);
+    }
+    let next = hit.block_pos.offset_with_direction(hit.direction);
+    is_replaceable(BlockKind::from(block_at(world, next))).then_some(next)
 }
 
 /// `BlockState.useItemOn`, client branch.

@@ -239,6 +239,17 @@ pub struct StartUseItemQueued {
     /// it, but should be avoided to stay compatible with anticheats.
     pub force_block: Option<BlockPos>,
 }
+/// The latest block that one of our right clicks was predicted to place.
+///
+/// Vanilla places the block on the client as soon as the click lands and lets
+/// the server correct it; azalea doesn't change its world, so this records what
+/// the click did instead. `seq` grows with every new placement.
+#[derive(Clone, Component, Copy, Debug)]
+pub struct PredictedPlacement {
+    pub placement: predict::Placement,
+    pub seq: u32,
+}
+
 /// Vanilla's `Minecraft.startUseItem`: try each hand in turn (from the queued
 /// hand onwards), first on the targeted entity or block and then by using the
 /// held item, and stop at the first step that succeeds (or, for a block, at a
@@ -273,6 +284,7 @@ pub fn handle_start_use_item_queued(
     )>,
     worlds: Res<Worlds>,
     targets: Query<(&EntityKindComponent, Has<Dead>)>,
+    placements: Query<&PredictedPlacement>,
 ) {
     for (
         entity,
@@ -391,7 +403,14 @@ pub fn handle_start_use_item_queued(
                             seq,
                         },
                     ));
-                    match predict::use_item_on(&world, &actor, hand, r) {
+                    let (result, placement) = predict::use_item_on_placing(&world, &actor, hand, r);
+                    if let Some(placement) = placement {
+                        let seq = placements.get(entity).map_or(0, |last| last.seq) + 1;
+                        commands
+                            .entity(entity)
+                            .insert(PredictedPlacement { placement, seq });
+                    }
+                    match result {
                         predict::InteractionResult::Success(source) => {
                             if source == predict::Swing::Client {
                                 swing(&mut commands, hand);
