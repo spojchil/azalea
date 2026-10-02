@@ -354,6 +354,7 @@ pub fn handle_start_use_item_queued(
             eye_position: position.up(dimensions.eye_height.into()),
             look_direction: *look_direction,
             block_interaction_range: attributes.block_interaction_range.calculate(),
+            bounding_box: dimensions.make_bounding_box(**position),
         };
         let swing = |commands: &mut Commands, hand: InteractionHand| {
             commands.trigger(SendGamePacketEvent::new(entity, ServerboundSwing { hand }));

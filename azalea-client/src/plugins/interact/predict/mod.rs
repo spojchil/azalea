@@ -27,6 +27,7 @@ use std::collections::HashMap;
 
 use azalea_block::{BlockState, BlockTrait, fluid_state::FluidKind};
 use azalea_core::{
+    aabb::Aabb,
     direction::{Axis, Direction},
     game_type::GameMode,
     hit_result::BlockHitResult,
@@ -99,6 +100,8 @@ pub struct Actor<'a> {
     pub eye_position: Vec3,
     pub look_direction: LookDirection,
     pub block_interaction_range: f64,
+    /// The player's own hitbox; a placed block may not collide with it.
+    pub bounding_box: Aabb,
 }
 
 impl Actor<'_> {
@@ -282,9 +285,12 @@ pub struct Placement {
 /// [`use_item_on`], plus where the held block item lands when the click is
 /// predicted to place it.
 ///
-/// Approximation: like [`can_place`], the spot only has to be replaceable;
-/// vanilla also checks the placement state can survive there and that no
-/// entity is in the way, and the server has the final say.
+/// `BlockItem.place` fails when the block would collide with the player
+/// (`Level.isUnobstructed`). Approximations: the block's default state stands
+/// in for its placement state, any non-empty collision shape counts as a full
+/// cube, only our own hitbox is checked (not other entities), and like
+/// [`can_place`] the spot only has to be replaceable, not survivable. The
+/// server has the final say.
 pub fn use_item_on_placing(
     world: &World,
     actor: &Actor,
@@ -322,7 +328,26 @@ pub fn use_item_on_placing(
             .and_then(|block| placement_pos(world, hit).map(|pos| Placement { pos, block })),
         _ => None,
     };
+    if let Some(placement) = placement
+        && obstructs(actor, placement)
+    {
+        return (Fail, None);
+    }
     (result, placement)
+}
+
+/// Whether the placed block would collide with the player.
+fn obstructs(actor: &Actor, placement: Placement) -> bool {
+    use azalea_physics::collision::BlockWithShape;
+
+    if BlockState::from(placement.block).is_collision_shape_empty() {
+        return false;
+    }
+    let min = placement.pos.to_vec3_floored();
+    actor.bounding_box.intersects_aabb(&Aabb {
+        min,
+        max: min + Vec3::new(1.0, 1.0, 1.0),
+    })
 }
 
 /// `BlockPlaceContext.getClickedPos`: the clicked block itself when it can be
