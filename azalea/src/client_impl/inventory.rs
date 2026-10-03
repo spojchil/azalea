@@ -1,4 +1,4 @@
-use azalea_client::inventory::SetSelectedHotbarSlotEvent;
+use azalea_client::inventory::{DropHeldItemEvent, SetSelectedHotbarSlotEvent};
 use azalea_entity::inventory::Inventory;
 use azalea_inventory::Menu;
 
@@ -43,6 +43,16 @@ impl Client {
         ecs.trigger(SetSelectedHotbarSlotEvent {
             entity: self.entity,
             slot: new_hotbar_slot_index,
+        });
+    }
+
+    /// Drop the held item (or the whole held stack), like pressing Q (or
+    /// Ctrl+Q). See [`DropHeldItemEvent`].
+    pub fn drop_held_item(&self, whole_stack: bool) {
+        let mut ecs = self.ecs.write();
+        ecs.trigger(DropHeldItemEvent {
+            entity: self.entity,
+            whole_stack,
         });
     }
 }

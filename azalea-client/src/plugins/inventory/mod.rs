@@ -1,13 +1,14 @@
 pub mod equipment_effects;
 
 use azalea_chat::FormattedText;
-use azalea_core::tick::GameTick;
+use azalea_core::{direction::Direction, game_type::GameMode, position::BlockPos, tick::GameTick};
 use azalea_entity::{PlayerAbilities, inventory::Inventory as Inv};
 use azalea_inventory::operations::ClickOperation;
 pub use azalea_inventory::*;
 use azalea_protocol::packets::game::{
     s_container_click::{HashedStack, ServerboundContainerClick},
     s_container_close::ServerboundContainerClose,
+    s_player_action::{self, ServerboundPlayerAction},
     s_set_carried_item::ServerboundSetCarriedItem,
 };
 use azalea_registry::builtin::MenuKind;
@@ -19,6 +20,7 @@ use tracing::{error, warn};
 
 use crate::{
     inventory::equipment_effects::{collect_equipment_changes, handle_equipment_changes},
+    local_player::LocalGameMode,
     packet::game::SendGamePacketEvent,
 };
 
@@ -48,6 +50,7 @@ impl Plugin for InventoryPlugin {
         // number keys are checked on tick but scrolling can happen outside of ticks, therefore
         // this is fine
         .add_observer(handle_set_selected_hotbar_slot_event)
+        .add_observer(handle_drop_held_item_event)
         .add_observer(handle_equipment_changes);
     }
 }
@@ -270,6 +273,53 @@ pub fn handle_set_selected_hotbar_slot_event(
 ) {
     let mut inventory = query.get_mut(set_selected_hotbar_slot.entity).unwrap();
     inventory.selected_hotbar_slot = set_selected_hotbar_slot.slot;
+}
+
+/// An ECS event to drop the held item, like pressing the drop key (Q).
+///
+/// Like vanilla's `LocalPlayer.drop`, the item leaves the selected hotbar
+/// slot on the client right away and the server corrects the slot if it
+/// disagrees. Spectators can't drop items.
+#[derive(EntityEvent)]
+pub struct DropHeldItemEvent {
+    pub entity: Entity,
+    /// Drop the whole stack (Ctrl+Q) instead of a single item.
+    pub whole_stack: bool,
+}
+pub fn handle_drop_held_item_event(
+    drop: On<DropHeldItemEvent>,
+    mut commands: Commands,
+    mut query: Query<(&mut Inv, &LocalGameMode)>,
+) {
+    let Ok((mut inventory, game_mode)) = query.get_mut(drop.entity) else {
+        return;
+    };
+    if game_mode.current == GameMode::Spectator {
+        return;
+    }
+    // `Inventory.removeFromSelected`
+    let slot = *Player::HOTBAR_SLOTS.start() + usize::from(inventory.selected_hotbar_slot);
+    if let Some(held) = inventory.inventory_menu.slot_mut(slot) {
+        let count = if drop.whole_stack {
+            held.count().max(0) as u32
+        } else {
+            1
+        };
+        held.split(count);
+    }
+    commands.trigger(SendGamePacketEvent::new(
+        drop.entity,
+        ServerboundPlayerAction {
+            action: if drop.whole_stack {
+                s_player_action::Action::DropAllItems
+            } else {
+                s_player_action::Action::DropItem
+            },
+            pos: BlockPos::default(),
+            direction: Direction::Down,
+            seq: 0,
+        },
+    ));
 }
 
 /// The item slot that the server thinks we have selected.
