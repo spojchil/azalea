@@ -272,7 +272,7 @@ pub fn use_item_on(
     hand: InteractionHand,
     hit: &BlockHitResult,
 ) -> InteractionResult {
-    use_item_on_placing(world, actor, hand, hit).0
+    use_item_on_placing(world, actor, hand, hit).result
 }
 
 /// A block that a successful right click is predicted to have placed.
@@ -282,8 +282,40 @@ pub struct Placement {
     pub block: BlockKind,
 }
 
+/// What the clicked block itself does when it handles a right click
+/// (`useWithoutItem`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockUse {
+    /// Vanilla's client sets these block states right away (the override has
+    /// no `isClientSide` guard); the server sends its own version afterwards.
+    Client(Vec<(BlockPos, BlockState)>),
+    /// The block changes, but only the server changes it.
+    Server,
+}
+
+/// The outcome of [`use_item_on_placing`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UseOn {
+    pub result: InteractionResult,
+    /// Where the held block item lands, when the click places it.
+    pub placement: Option<Placement>,
+    /// What the clicked block does, when it handles the click itself.
+    pub block_use: Option<BlockUse>,
+}
+
+impl UseOn {
+    fn result(result: InteractionResult) -> Self {
+        Self {
+            result,
+            placement: None,
+            block_use: None,
+        }
+    }
+}
+
 /// [`use_item_on`], plus where the held block item lands when the click is
-/// predicted to place it.
+/// predicted to place it, and what the clicked block does when it handles the
+/// click itself.
 ///
 /// `BlockItem.place` fails when the block would collide with the player
 /// (`Level.isUnobstructed`). Approximations: the block's default state stands
@@ -296,10 +328,10 @@ pub fn use_item_on_placing(
     actor: &Actor,
     hand: InteractionHand,
     hit: &BlockHitResult,
-) -> (InteractionResult, Option<Placement>) {
+) -> UseOn {
     let item = actor.item(hand);
     if actor.game_mode == GameMode::Spectator {
-        return (CONSUME, None);
+        return UseOn::result(CONSUME);
     }
     let have_something = !actor.item(InteractionHand::MainHand).is_empty()
         || !actor.item(InteractionHand::OffHand).is_empty();
@@ -308,19 +340,23 @@ pub fn use_item_on_placing(
         let state = block_at(world, hit.block_pos);
         let item_use = block_use_item_on_result(world, actor, state, item, hand, hit);
         if item_use.consumes_action() {
-            return (item_use, None);
+            return UseOn::result(item_use);
         }
         if item_use == TryWithEmptyHand && hand == InteractionHand::MainHand {
             let used = block_use_without_item_result(actor, state, hit);
             if used.consumes_action() {
-                return (used, None);
+                return UseOn {
+                    result: used,
+                    placement: None,
+                    block_use: block_use_without_item_effect(world, actor, state, hit),
+                };
             }
         }
     }
     // Item cooldowns aren't tracked; vanilla returns PASS here while the item
     // is on cooldown.
     if item.is_empty() {
-        return (Pass, None);
+        return UseOn::result(Pass);
     }
     let result = item_use_on_result(world, actor, hand, item, hit);
     let placement = match (result, item_use_on(kind(item))) {
@@ -331,9 +367,13 @@ pub fn use_item_on_placing(
     if let Some(placement) = placement
         && obstructs(actor, placement)
     {
-        return (Fail, None);
+        return UseOn::result(Fail);
     }
-    (result, placement)
+    UseOn {
+        result,
+        placement,
+        block_use: None,
+    }
 }
 
 /// Whether the placed block would collide with the player.
@@ -828,6 +868,133 @@ fn block_use_without_item_result(
     }
 }
 
+/// What a `useWithoutItem` that consumed the click does to the world.
+///
+/// [`BlockUse::Client`] transcribes the overrides that call `setBlock` on the
+/// client too; [`BlockUse::Server`] lists the ones that always change the
+/// clicked block but only on the server. Everything else (menus, beds, bells,
+/// signs, ...) changes no block state and gives `None`.
+fn block_use_without_item_effect(
+    world: &World,
+    actor: &Actor,
+    state: BlockState,
+    hit: &BlockHitResult,
+) -> Option<BlockUse> {
+    // A CONSUME (a pressed button, an empty pot, a cake we can't eat) leaves
+    // the block alone.
+    if block_use_without_item_result(actor, state, hit) != SUCCESS {
+        return None;
+    }
+    let pos = hit.block_pos;
+    let block = BlockKind::from(state);
+    let changes = match block_use_without_item(block) {
+        BlockUseWithoutItem::DoorBlock => {
+            // `state.cycle(OPEN)`, then the other half follows through
+            // `DoorBlock.updateShape` (flags 10 don't skip shape updates).
+            let opened = cycle(state, "open");
+            let other_pos = if property(state, "half") == Some("lower") {
+                pos.up(1)
+            } else {
+                pos.down(1)
+            };
+            let other = block_at(world, other_pos);
+            let mut changes = vec![(pos, opened)];
+            if block_use_without_item(BlockKind::from(other)) == BlockUseWithoutItem::DoorBlock
+                && property(other, "half") != property(state, "half")
+            {
+                let half = property(other, "half").unwrap_or("upper");
+                changes.push((other_pos, with(opened, "half", half)));
+            }
+            changes
+        }
+        // `TrapDoorBlock.toggle`
+        BlockUseWithoutItem::TrapDoorBlock => vec![(pos, cycle(state, "open"))],
+        BlockUseWithoutItem::FenceGateBlock => {
+            if flag(state, "open") {
+                vec![(pos, with(state, "open", "false"))]
+            } else {
+                let direction = player_direction(actor.look_direction.y_rot());
+                let mut opened = state;
+                if facing(state) == Some(direction.opposite()) {
+                    opened = with(opened, "facing", direction_name(direction));
+                }
+                vec![(pos, with(opened, "open", "true"))]
+            }
+        }
+        // `ButtonBlock.press`
+        BlockUseWithoutItem::ButtonBlock => vec![(pos, with(state, "powered", "true"))],
+        BlockUseWithoutItem::RepeaterBlock => vec![(pos, cycle(state, "delay"))],
+        BlockUseWithoutItem::ComparatorBlock => vec![(pos, cycle(state, "mode"))],
+        // Taking the plant out also gives it to the player; only the block is
+        // predicted here.
+        BlockUseWithoutItem::FlowerPotBlock => vec![(pos, BlockKind::FlowerPot.into())],
+        BlockUseWithoutItem::LeverBlock
+        | BlockUseWithoutItem::NoteBlock
+        | BlockUseWithoutItem::DaylightDetectorBlock
+        | BlockUseWithoutItem::CakeBlock
+        | BlockUseWithoutItem::CandleCakeBlock
+        | BlockUseWithoutItem::SweetBerryBushBlock
+        | BlockUseWithoutItem::CaveVinesBlock
+        | BlockUseWithoutItem::CaveVinesPlantBlock
+        | BlockUseWithoutItem::ComposterBlock
+        | BlockUseWithoutItem::JukeboxBlock
+        | BlockUseWithoutItem::ChiseledBookShelfBlock
+        | BlockUseWithoutItem::RedStoneWireBlock
+        | BlockUseWithoutItem::DragonEggBlock => return Some(BlockUse::Server),
+        _ => return None,
+    };
+    Some(BlockUse::Client(changes))
+}
+
+/// `state.setValue(name, value)`; unchanged when the block has no such
+/// property.
+fn with(state: BlockState, name: &str, value: &str) -> BlockState {
+    let mut block = Box::<dyn BlockTrait>::from(state);
+    if block.set_property(name, value).is_err() {
+        return state;
+    }
+    block.as_block_state()
+}
+
+/// `state.cycle(property)`: the next value in the property's order.
+fn cycle(state: BlockState, name: &str) -> BlockState {
+    let values: &[&str] = match name {
+        "open" | "powered" => &["true", "false"],
+        "delay" => &["1", "2", "3", "4"],
+        "mode" => &["compare", "subtract"],
+        _ => return state,
+    };
+    let Some(current) = property(state, name) else {
+        return state;
+    };
+    let next = values
+        .iter()
+        .position(|v| *v == current)
+        .map_or(values[0], |i| values[(i + 1) % values.len()]);
+    with(state, name, next)
+}
+
+/// `Entity.getDirection`, which is `Direction.fromYRot(yRot)`.
+fn player_direction(y_rot: f32) -> Direction {
+    match (f64::from(y_rot) / 90.0 + 0.5).floor() as i64 & 3 {
+        0 => Direction::South,
+        1 => Direction::West,
+        2 => Direction::North,
+        _ => Direction::East,
+    }
+}
+
+fn direction_name(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Down => "down",
+        Direction::Up => "up",
+        Direction::North => "north",
+        Direction::South => "south",
+        Direction::West => "west",
+        Direction::East => "east",
+    }
+}
+
 /// `BellBlock.isProperHit`.
 fn bell_proper_hit(state: BlockState, hit: &BlockHitResult) -> bool {
     let click_y = hit.location.y - hit.block_pos.y as f64;
@@ -1314,4 +1481,47 @@ fn entity_interact_result(item: &ItemStack, target: &Target) -> InteractionResul
         }
     }
     Pass
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cycle_follows_the_property_order() {
+        let door: BlockState = BlockKind::OakDoor.into();
+        let closed = with(door, "open", "false");
+        assert_eq!(property(cycle(closed, "open"), "open"), Some("true"));
+        assert_eq!(
+            property(cycle(cycle(closed, "open"), "open"), "open"),
+            Some("false")
+        );
+
+        let repeater = with(BlockKind::Repeater.into(), "delay", "4");
+        assert_eq!(property(cycle(repeater, "delay"), "delay"), Some("1"));
+
+        let comparator = with(BlockKind::Comparator.into(), "mode", "compare");
+        assert_eq!(
+            property(cycle(comparator, "mode"), "mode"),
+            Some("subtract")
+        );
+    }
+
+    #[test]
+    fn with_leaves_unknown_properties_alone() {
+        let stone: BlockState = BlockKind::Stone.into();
+        assert_eq!(with(stone, "open", "true"), stone);
+        assert_eq!(cycle(stone, "open"), stone);
+    }
+
+    #[test]
+    fn player_direction_matches_from_y_rot() {
+        assert_eq!(player_direction(0.0), Direction::South);
+        assert_eq!(player_direction(90.0), Direction::West);
+        assert_eq!(player_direction(-180.0), Direction::North);
+        assert_eq!(player_direction(-90.0), Direction::East);
+        assert_eq!(player_direction(44.0), Direction::South);
+        assert_eq!(player_direction(46.0), Direction::West);
+        assert_eq!(player_direction(359.0), Direction::South);
+    }
 }

@@ -250,6 +250,19 @@ pub struct PredictedPlacement {
     pub seq: u32,
 }
 
+/// The latest block that one of our right clicks used directly
+/// (`useWithoutItem`), like flipping a lever or opening a door.
+///
+/// When vanilla's client changes the block itself, azalea does the same to its
+/// world as a prediction the server can roll back, and `block_use` lists the
+/// new states. `seq` grows with every new use.
+#[derive(Clone, Component, Debug)]
+pub struct PredictedBlockUse {
+    pub pos: BlockPos,
+    pub block_use: predict::BlockUse,
+    pub seq: u32,
+}
+
 /// Vanilla's `Minecraft.startUseItem`: try each hand in turn (from the queued
 /// hand onwards), first on the targeted entity or block and then by using the
 /// held item, and stop at the first step that succeeds (or, for a block, at a
@@ -285,6 +298,7 @@ pub fn handle_start_use_item_queued(
     worlds: Res<Worlds>,
     targets: Query<(&EntityKindComponent, Has<Dead>)>,
     placements: Query<&PredictedPlacement>,
+    block_uses: Query<&PredictedBlockUse>,
 ) {
     for (
         entity,
@@ -404,12 +418,31 @@ pub fn handle_start_use_item_queued(
                             seq,
                         },
                     ));
-                    let (result, placement) = predict::use_item_on_placing(&world, &actor, hand, r);
+                    let predict::UseOn {
+                        result,
+                        placement,
+                        block_use,
+                    } = predict::use_item_on_placing(&world, &actor, hand, r);
                     if let Some(placement) = placement {
                         let seq = placements.get(entity).map_or(0, |last| last.seq) + 1;
                         commands
                             .entity(entity)
                             .insert(PredictedPlacement { placement, seq });
+                    }
+                    if let Some(block_use) = block_use {
+                        if let predict::BlockUse::Client(changes) = &block_use {
+                            for (pos, state) in changes {
+                                let old = world.get_block_state(*pos).unwrap_or_default();
+                                prediction_handler.retain_known_server_state(*pos, old, **position);
+                                world.set_block_state(*pos, *state);
+                            }
+                        }
+                        let seq = block_uses.get(entity).map_or(0, |last| last.seq) + 1;
+                        commands.entity(entity).insert(PredictedBlockUse {
+                            pos: r.block_pos,
+                            block_use,
+                            seq,
+                        });
                     }
                     match result {
                         predict::InteractionResult::Success(source) => {
