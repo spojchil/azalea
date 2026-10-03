@@ -241,9 +241,9 @@ pub struct StartUseItemQueued {
 }
 /// The latest block that one of our right clicks was predicted to place.
 ///
-/// Vanilla places the block on the client as soon as the click lands and lets
-/// the server correct it; azalea doesn't change its world, so this records what
-/// the click did instead. `seq` grows with every new placement.
+/// Like vanilla, the block is also put into our world (and taken out of the
+/// hand) as soon as the click lands, as a prediction the server can roll back.
+/// `seq` grows with every new placement.
 #[derive(Clone, Component, Copy, Debug)]
 pub struct PredictedPlacement {
     pub placement: predict::Placement,
@@ -424,6 +424,25 @@ pub fn handle_start_use_item_queued(
                         block_use,
                     } = predict::use_item_on_placing(&world, &actor, hand, r);
                     if let Some(placement) = placement {
+                        // `BlockItem.place` sets the block and consumes the item on the
+                        // client too. Approximation: the block's default state stands in
+                        // for its placement state; the server's update corrects it.
+                        let old = world.get_block_state(placement.pos).unwrap_or_default();
+                        prediction_handler.retain_known_server_state(
+                            placement.pos,
+                            old,
+                            **position,
+                        );
+                        world.set_block_state(placement.pos, placement.block.into());
+                        if !abilities.instant_break {
+                            commands
+                                .entity(entity)
+                                .queue(move |mut player: EntityWorldMut| {
+                                    if let Some(mut inventory) = player.get_mut::<Inventory>() {
+                                        consume_one(&mut inventory, hand);
+                                    }
+                                });
+                        }
                         let seq = placements.get(entity).map_or(0, |last| last.seq) + 1;
                         commands
                             .entity(entity)
@@ -479,6 +498,21 @@ pub fn handle_start_use_item_queued(
                 }
             }
         }
+    }
+}
+
+/// `itemStack.consume(1, player)` for the item in `hand`.
+fn consume_one(inventory: &mut Inventory, hand: InteractionHand) {
+    let item = match hand {
+        InteractionHand::MainHand => {
+            let slot = *azalea_inventory::Player::HOTBAR_SLOTS.start()
+                + usize::from(inventory.selected_hotbar_slot);
+            inventory.inventory_menu.slot_mut(slot)
+        }
+        InteractionHand::OffHand => Some(&mut inventory.inventory_menu.as_player_mut().offhand),
+    };
+    if let Some(item) = item {
+        item.split(1);
     }
 }
 
