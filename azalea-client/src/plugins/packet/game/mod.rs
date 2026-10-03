@@ -1,6 +1,9 @@
 mod events;
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+};
 
 use azalea_core::{
     delta::PositionDelta8,
@@ -14,7 +17,7 @@ use azalea_entity::{
     effect_events::{AddEffectEvent, RemoveEffectsEvent},
     indexing::{EntityIdIndex, EntityUuidIndex},
     inventory::Inventory,
-    metadata::{Health, apply_metadata},
+    metadata::{Health, ItemItem, apply_metadata},
 };
 use azalea_protocol::{
     common::movements::MoveFlags,
@@ -1595,7 +1598,33 @@ impl GamePacketHandler<'_> {
     pub fn stop_sound(&mut self, _p: &ClientboundStopSound) {}
     pub fn tab_list(&mut self, _p: &ClientboundTabList) {}
     pub fn tag_query(&mut self, _p: &ClientboundTagQuery) {}
-    pub fn take_item_entity(&mut self, _p: &ClientboundTakeItemEntity) {}
+    pub fn take_item_entity(&mut self, p: &ClientboundTakeItemEntity) {
+        as_system::<(
+            Commands,
+            Query<(&EntityIdIndex, Option<&mut TakenItems>)>,
+            Query<&ItemItem>,
+        )>(self.ecs, |(mut commands, mut query, items)| {
+            let Ok((index, taken)) = query.get_mut(self.player) else {
+                return;
+            };
+            let item_entity = MinecraftEntityId::from(p.item_id);
+            let Some(item) = index
+                .get_by_minecraft_entity(item_entity)
+                .and_then(|entity| items.get(entity).ok())
+            else {
+                return;
+            };
+            let entry = (item_entity, item.0.clone());
+            match taken {
+                Some(mut taken) => taken.push(entry),
+                None => {
+                    let mut taken = TakenItems::default();
+                    taken.push(entry);
+                    commands.entity(self.player).insert(taken);
+                }
+            }
+        });
+    }
     pub fn bundle_delimiter(&mut self, _p: &ClientboundBundleDelimiter) {}
     pub fn damage_event(&mut self, _p: &ClientboundDamageEvent) {}
     pub fn hurt_animation(&mut self, _p: &ClientboundHurtAnimation) {}
@@ -1739,4 +1768,35 @@ fn move_entity(
     }
 
     physics.set_on_ground(p.on_ground);
+}
+
+/// The item stacks of item entities that were recently picked up (by anyone),
+/// keyed by the item entity's protocol id.
+///
+/// The server removes a picked up item entity right after the take packet, so
+/// anything that reads packets later (after the entity is gone) can look up
+/// what was taken here. Only the latest [`TakenItems::CAPACITY`] are kept.
+#[derive(Clone, Component, Debug, Default)]
+pub struct TakenItems {
+    pub recent: VecDeque<(MinecraftEntityId, azalea_inventory::ItemStack)>,
+}
+
+impl TakenItems {
+    pub const CAPACITY: usize = 64;
+
+    fn push(&mut self, entry: (MinecraftEntityId, azalea_inventory::ItemStack)) {
+        if self.recent.len() == Self::CAPACITY {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(entry);
+    }
+
+    /// What the item entity with this protocol id held when it was taken.
+    pub fn get(&self, item_entity: MinecraftEntityId) -> Option<&azalea_inventory::ItemStack> {
+        self.recent
+            .iter()
+            .rev()
+            .find(|(id, _)| *id == item_entity)
+            .map(|(_, item)| item)
+    }
 }
